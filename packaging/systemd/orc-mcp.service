@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenRemoteConnector MCP service
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/openremoteconnector/current/bin/orc-mcp --config %h/.config/openremoteconnector/mcp.json
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

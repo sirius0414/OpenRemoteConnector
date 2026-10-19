@@ -1,0 +1,62 @@
+{
+  "date": "2026-10-18",
+  "host": "Darwin arm64",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+  "cargo": "1.99.1 (5f94df478 2026-08-27)",
+  "checks": {
+    "format": {
+      "command": "cargo fmt --all --check",
+      "passed": true
+    },
+    "clippy": {
+      "command": "cargo clippy --workspace --all-targets --locked --offline -- -D warnings",
+      "passed": true
+    },
+    "tests": {
+      "command": "cargo test --workspace --locked --offline",
+      "passed": 124,
+      "failed": 0,
+      "ignored_on_this_host": 0,
+      "local_sockets_required": true
+    },
+    "setup_smoke": {
+      "role": "complete",
+      "passed": true,
+      "repeated_setup_preserves_both_identities": true,
+      "doctor_success_does_not_claim_tls_or_remote_readiness": true
+    },
+    "skill_validation": {
+      "command": "quick_validate.py skills/orc",
+      "passed": true
+    },
+    "linux_cross_clippy": {
+      "target": "x86_64-unknown-linux-gnu",
+      "packages": [
+        "orc-execution",
+        "orc-backend-host-linux",
+        "orc-backend-gvisor",
+        "orc-runner",
+        "orc-watchdog"
+      ],
+      "all_targets": true,
+      "warnings_denied": true,
+      "passed": true,
+      "runtime_tests_executed": false
+    },
+    "release_build": {
+      "command": "cargo build --workspace --release --locked --offline",
+      "passed": true,
+      "warnings": 0,
+      "target": "aarch64-apple-darwin",
+      "linux_executables_built": false
+    }
+  },
+  "not_executed": [
+    "Linux-only runner and real systemd tests (compiled for Linux; scheduled in CI)",
+    "gVisor execution and resource/network acceptance",
+    "Two independent Ubuntu hosts",
+    "Native Codex and ChatGPT OAuth integration",
+    "Published signed release installation and adjacent-version compatibility"
+  ],
+  "release_acceptance": false
+}

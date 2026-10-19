@@ -1,0 +1,13 @@
+[package]
+name = "orc-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+async-trait.workspace = true

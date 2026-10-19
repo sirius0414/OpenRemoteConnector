@@ -1,0 +1,42 @@
+name: Rust checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.1"
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Unit and Linux runner integration tests
+        run: cargo test --workspace --locked
+        env:
+          ORC_TEST_SECRET: should-not-be-inherited
+      - name: Release build
+        run: cargo build --workspace --locked --release
+      - name: Real systemd user execution fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          worker_uid="$(id -u)"
+          worker_name="$(id -un)"
+          test "$worker_uid" -ne 0
+          sudo loginctl enable-linger "$worker_name"
+          sudo systemctl start "user@${worker_uid}.service"
+          export XDG_RUNTIME_DIR="/run/user/${worker_uid}"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+          export ORC_TEST_RUNNER_PATH="$PWD/target/release/orc-runner"
+          systemctl --user show-environment >/dev/null
+          cargo test --locked -p orc-backend-host-linux --test systemd_linux -- --ignored --test-threads=1
+# Full two-device, rootless gVisor, quota and client acceptance remains a release
+# gate. The minimal systemd fixture above does not replace that acceptance.

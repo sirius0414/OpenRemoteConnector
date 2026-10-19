@@ -1,0 +1,27 @@
+[package]
+name = "orc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orc"
+path = "src/main.rs"
+
+[dependencies]
+orc-admin = { path = "../orc-admin" }
+orc-domain = { path = "../orc-domain" }
+orc-protocol = { path = "../orc-protocol" }
+orc-installer = { path = "../orc-installer" }
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+libc.workspace = true
+uuid.workspace = true
+
+orc-transport = { path = "../orc-transport" }
+orc-workspace = { path = "../orc-workspace" }
+
+[dev-dependencies]
+tempfile.workspace = true

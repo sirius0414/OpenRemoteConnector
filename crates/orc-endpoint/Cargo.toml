@@ -1,0 +1,36 @@
+[package]
+name = "orc-endpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orc-domain = { path = "../orc-domain" }
+orc-protocol = { path = "../orc-protocol" }
+orc-store = { path = "../orc-store" }
+orc-admin = { path = "../orc-admin" }
+orc-execution = { path = "../orc-execution" }
+orc-backend-host-linux = { path = "../orc-backend-host-linux" }
+orc-backend-gvisor = { path = "../orc-backend-gvisor" }
+orc-workspace = { path = "../orc-workspace" }
+orc-transport = { path = "../orc-transport" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+clap.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures-util = "0.3"
+tokio-tungstenite = "0.28"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+libc.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rcgen = { version = "0.14", features = ["pem"] }

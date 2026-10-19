@@ -1,24 +1,44 @@
 # OpenRemoteConnector
 
-让用户把自己设备上的指定能力，安全、可撤销地授权给不同 Agent 使用。
+让设备所有者将指定能力、在有限期限内授权给 Agent，并在终端保留授权、审批与停止任务的最终控制。
 
-项目当前处于需求设计阶段，尚未实现或通过产品验收。当前需求以 PRD v0.4 为准：**Agent Plugin / Skill、独立 MCP 服务、终端执行端**，Linux 为第一优先级，macOS 为第二优先级。实现语言统一采用 Rust；连接、认证、存储和执行后端的具体依赖组合待 M0 验证。
+当前仓库已包含 Rust 实现和测试，处于 **P0 开发验证阶段，尚未达到 P0 发布验收**。Linux Ubuntu 24.04 x86_64 是执行目标；macOS 可运行控制层和开发测试，不提供宿主执行后备。实际完成范围、功能缺口与未验收项目见 [P0 状态](docs/validation/P0-STATUS.md)。
 
-- [当前 PRD：用户场景、功能要求与验收标准](docs/PRD.md)
-- [当前 Architecture：职责、行为契约与架构验收](docs/ARCHITECTURE.md)
-- [Rust 设计文档：技术选型、依赖组件、模块接口、执行与恢复算法、实施及验收方案](docs/DESIGN.md)
-- [当前 MVP：开源对比、核心价值与首版验证](docs/MVP.md)
-- [历史参考：旧 MVP 与支持范围](docs/history/MVP-2026-10-15.md)
-- [历史参考：归档技术架构与组件选型](docs/history/ARCHITECTURE-2026-10-15.md)
-- [历史参考：旧 Linux 沙箱设计](docs/LINUX_SANDBOX.md)
+## 构建与使用
 
-首版目标：用户通过一个独立 MCP 服务，让 Codex CLI 与具备相应接入权限的 ChatGPT 使用至少两台 Ubuntu 24.04 LTS x86_64 终端。MCP 可以与执行端同机或集中部署；仅安装 MCP 不自动获得所在机器的执行能力。
+```sh
+cargo build --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo run -p orc-cli -- --help
+```
 
-终端所有者分别选择隔离或宿主执行，以及自动放行、规则过滤或逐次确认。隔离任务使用获准副本，回写须审核；宿主任务可使用执行账户的真实文件与工具，不能将工作目录或命令过滤宣传为文件隔离。隔离失败不自动转为宿主执行。
+[快速开始](docs/QUICKSTART.md) 说明角色初始化、TLS、客户端登录、设备信任和本机 grant。开发者可运行 `cargo run -p orc-cli -- setup --role complete --root /absolute/private/orc` 生成独立配置；初始化不自动开放执行权限，缺少证书、连接或授权时保持不可执行。源码构建需要固定 Rust 工具链；离线安装器支持核验指定发布者签名和包摘要，仓库尚无公开发行包下载地址。
 
-Linux 以一条命令进入角色选择、网络前提检查与初始化向导；Agent 侧以一个 Skill 引导原生连接与认证；macOS 后续提供签名、公证 App。安装入口和 Skill 尚未实现。远程可用性按实际两段链路验证，不要求强制官方服务，也不承诺缺少可达入口时自动互连；额外服务器或服务的条件与费用需明确展示。
+交付二进制：
 
-MCP 是用户选择的客户端认证与数据处理可信方，终端保留本机权限的最终限制。任务不随单次请求连接结束而取消；MCP 与终端失联、撤销和到期按独立规则处理。云端 Agent 收到的工具结果仍会进入其服务商的数据处理链路。
+- `orc`：角色初始化、诊断、签名离线包校验/安装和本地管理。
+- `orc-mcp`：OAuth、原生 MCP、设备目录与转发；不包含执行后端。
+- `orc-endpoint`：终端授权、策略、审批、异步任务、快照与文本回写。
+- `orc-runner` 与 `orc-watchdog`：Linux 任务监督、受控入口执行与独立停止核实。
 
-当前 MVP 基于开源项目对比，重点验证终端所有者授权、可选执行环境与多设备使用的组合价值，包含替代方案、首版工作流和试用方法；价值尚未得到实测证明。当前 Architecture 与 PRD v0.4 对齐并保持技术中立；设计文档已确定 Rust，实现依赖、协议集成和执行后端仍需可行性验证。归档 MVP、归档架构和旧沙箱文档保留用于追溯，不作为当前实现或选型依据。
+MCP 和终端各有独立 SQLite 与安全 journal。设备主动连接 MCP 的双向 TLS 入口；Agent 使用原生 HTTP MCP 与 OAuth。公开 Agent 入口需自行配置可达 HTTPS 反向代理，设备 TLS 在 MCP 终止。无可达入口时不会自动购买服务器、创建账户或寻找中继。
 
+## 权限与任务语义
+
+登录、登记设备和安装 MCP 均不授予执行权限。授权绑定主体、设备、UID、环境、动作、策略和期限；两种执行环境各自支持自动、规则和逐次审批策略。Agent 无权创建 grant 或批准自己的请求。
+
+宿主模式使用执行账户的真实文件与工具，工作目录与规则不是文件隔离。隔离模式使用批准快照和固定离线环境；gVisor、专用 rootless 引擎或验证证据缺失时拒绝执行，不转为宿主模式。执行后端仍需在实际目标环境完成资源与停止验收。
+
+任务接受后不依赖单次 HTTP 请求存活。相同 UUIDv7 和相同请求用于重试；同 ID 不同内容拒绝。取消请求与终止确认分别显示，未知启动不会自动重跑。输出有界并视为不可信数据。隔离回写必须本地审批、核对基线和受管工作区排他约定；多文件失败逐项报告。
+
+## 文档与样例
+
+- [PRD](docs/PRD.md)、[架构契约](docs/ARCHITECTURE.md)、[详细设计](docs/DESIGN.md)
+- [当前验证与缺口](docs/validation/P0-STATUS.md)、[执行后端验证](docs/validation/EXECUTION.md)
+- [实现决策与偏离](docs/decisions/0001-rust-implementation.md)
+- [Agent 单入口 Skill](skills/orc/SKILL.md)
+- [离线工作流样例](examples/README.md)、[Python 环境](environments/python/README.md)
+
+`docs/history/` 和旧 `docs/LINUX_SANDBOX.md` 仅作历史参考。MCP 是客户端身份与数据处理可信方；MCP 失陷仍可能冒用已获准主体。宿主同账户任意代码不在管理 socket 的隔离保证内；云端 Agent 收到的结果进入其服务商的数据处理链路。

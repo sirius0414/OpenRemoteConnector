@@ -1,0 +1,42 @@
+[package]
+name = "orc-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+orc-transport = { path = "../orc-transport" }
+orc-domain = { path = "../orc-domain" }
+orc-protocol = { path = "../orc-protocol" }
+orc-store = { path = "../orc-store" }
+orc-auth = { path = "../orc-auth" }
+orc-admin = { path = "../orc-admin" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+clap.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = { version = "0.8", features = ["ws", "form", "query"] }
+rmcp = { version = "3.5", features = ["server", "transport-streamable-http-server"] }
+futures-util = "0.3"
+base64 = "0.22"
+getrandom = "0.3"
+url = "2"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-tungstenite = "0.28"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rcgen = { version = "0.14", features = ["pem"] }
+x509-parser = "0.18"
+schemars.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }

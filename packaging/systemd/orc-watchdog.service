@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenRemoteConnector independent stop-only watchdog
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/openremoteconnector/current/bin/orc-watchdog --config %h/.config/openremoteconnector/watchdog.json
+Restart=always
+RestartSec=1
+UMask=0077
+
+[Install]
+WantedBy=default.target

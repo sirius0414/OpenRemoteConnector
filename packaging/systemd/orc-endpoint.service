@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenRemoteConnector endpoint
+After=network-online.target orc-watchdog.service
+Wants=orc-watchdog.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/openremoteconnector/current/bin/orc-endpoint --config %h/.config/openremoteconnector/endpoint.json
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target
