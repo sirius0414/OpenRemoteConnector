@@ -1,4 +1,11 @@
-//! Endpoint authority, durable task acceptance and independently supervised work.
+//! 终端的最终授权边界：接受任务、推进生命周期、提供结果和本地管理。
+//!
+//! 远程调用链为 session → invoke → submit/resolve → Store；submit 只持久化接受，
+//! 独立 supervise/tick 循环负责审批消费、准备实例、最终复核和启动。
+//! 人工 review 优先看 submit 的去重顺序、tick 的启动关口以及 apply_changes 的逐文件授权。
+//! `gate` 串行协调本地权限变化与启动/回写；`body_lock` 协调正文引用建立和留存清理。
+//! 重启后不重跑旧任务，停止请求必须等后端证据确认。信任更换与正文清理见子模块。
+
 use orc_backend_gvisor::{GvisorBackend, GvisorConfig};
 use orc_backend_host_linux::{HostBackend, HostConfig};
 use orc_domain::*;
@@ -43,6 +50,7 @@ pub struct Config {
     #[serde(default)]
     pub continue_on_disconnect: bool,
 }
+/// 接受时固定的请求、授权版本和解析规格；load_body 另合并可恢复的运行实例引用。
 #[derive(Clone, Serialize, Deserialize)]
 struct TaskBody {
     request: TaskRequest,
@@ -60,7 +68,9 @@ pub struct Endpoint {
     pub store: Store,
     pub device_id: String,
     identity: IdentityFile,
+    // 保护本地权限变化与启动/逐文件回写关口；慢速 prepare 在释放锁后执行。
     gate: Arc<Mutex<()>>,
+    // 保护正文引用建立与 GC；同时需要两把锁时遵循 body_lock → gate。
     body_lock: Arc<Mutex<()>>,
     paused: Arc<std::sync::atomic::AtomicBool>,
     connected: Arc<std::sync::atomic::AtomicBool>,
@@ -79,6 +89,8 @@ fn val<T: Serialize>(v: T) -> std::result::Result<Value, AnyError> {
     Ok(serde_json::to_value(v)?)
 }
 impl Endpoint {
+    /// 校验本地 UID 和既有信任，加载持久状态，并将遗留任务转为待核实或未启动终态。
+    /// 重启不会重新调度旧 accepted/starting 任务，避免未知副作用被重复执行。
     pub async fn open(config: Config) -> std::result::Result<Self, AnyError> {
         if config.execution_uid == 0 || config.execution_uid != orc_admin::current_uid() {
             return Err("EXECUTION_UID_MISMATCH".into());
@@ -263,6 +275,7 @@ impl Endpoint {
             json!({"device_id":self.device_id,"execution_uid":self.config.execution_uid,"paused":self.paused.load(std::sync::atomic::Ordering::SeqCst),"grants":grants,"host":match host{Ok(c)=>serde_json::to_value(c)?,Err(e)=>json!({"available":false,"reason":e.to_string()})},"isolated_configured":self.config.gvisor.is_some(),"host_boundary":"commands can access real files and tools of the execution account; cwd is not isolation"}),
         )
     }
+    /// 接收已验证信封中的 Principal，调用本地授权路径并记录不含正文的审计结果。
     pub async fn invoke(
         &self,
         principal: Principal,
@@ -415,6 +428,8 @@ impl Endpoint {
         }
         Err("ACCESS_DENIED".into())
     }
+    /// 将原始请求解析为审批和运行共用的有效规格，然后按真实入口摘要评估规则。
+    /// 隔离分支只使用获准快照及固定镜像；此函数可能物化输入，但不启动用户命令。
     async fn resolve(
         &self,
         principal: &Principal,
@@ -610,6 +625,7 @@ impl Endpoint {
         };
         Ok((body, decision))
     }
+    /// 将内容寻址快照物化为只读输入；已有目录必须与获准清单完全一致才能复用。
     fn materialize(&self, snapshot: &Snapshot, target: &Path) -> std::result::Result<(), AnyError> {
         snapshot.verify()?;
         if target.exists() {
@@ -665,6 +681,8 @@ impl Endpoint {
         std::fs::rename(temp, target)?;
         Ok(())
     }
+    /// 先按原始请求摘要去重，再解析和持久化新任务；preview 共用解析逻辑但不接受任务。
+    /// 真正执行交给独立 tick，因此一次 HTTP 调用的结束不等于任务结束。
     async fn submit(
         &self,
         principal: Principal,
@@ -678,6 +696,7 @@ impl Endpoint {
             device_id: self.device_id.clone(),
             submission_id: request.submission_id.0.clone(),
         };
+        // 先查旧提交，再检查新请求时窗：已接受任务即使请求过期也只能返回原任务，不能重跑。
         if !preview && let Some(record) = self.store.get_submission(key.clone()).await? {
             if record.request_digest != digest {
                 return Err("SUBMISSION_CONFLICT".into());
@@ -727,6 +746,7 @@ impl Endpoint {
         if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("ENDPOINT_PAUSED".into());
         }
+        // 解析入口/快照期间可能发生权限变化；取得 gate 后重新读取并比较 grant。
         let current = self.grant(&request.grant_id.0).await?;
         current.authorize(&principal.id(), &request, Action::TaskSubmit, now())?;
         if current.revision != grant.revision || current.policy != grant.policy {
@@ -754,6 +774,7 @@ impl Endpoint {
         if decision.effect == RuleEffect::Review {
             body.approval_id = Some(format!("approval_{}", uuid::Uuid::now_v7()))
         }
+        // 原始请求摘要用于重试去重；此有效摘要另外绑定主体、grant 和实际执行规格，供审批使用。
         let effective_digest = orc_protocol::canonical_digest(&(
             principal.clone(),
             grant.clone(),
@@ -837,6 +858,8 @@ impl Endpoint {
             )
         }
     }
+    /// 将固定正文与运行实例合并；允许从 prepare 已写的 runtime.json 补回 DB 关联。
+    /// 磁盘与数据库身份不一致时拒绝，不能用另一个实例补齐未知结果。
     async fn load_body(&self, task: &StoredTask) -> std::result::Result<TaskBody, AnyError> {
         let mut body: TaskBody = serde_json::from_value(task.payload.clone())?;
         body.instance = self
@@ -944,6 +967,7 @@ impl Endpoint {
             json!({"device_id":self.device_id,"task_id":task.task_id,"stream":stream,"offset":offset,"next_offset":offset+bytes.len() as u64,"text":String::from_utf8_lossy(&bytes),"bytes":bytes.len(),"untrusted":true,"truncated":result.map(|r|r.output_truncated),"status":self.task_view(&task)?}),
         )
     }
+    /// 持久记录停止意图并立即返回；后续 tick 才操作后端并更新停止证据。
     async fn request_stop(
         &self,
         mut task: StoredTask,
@@ -988,6 +1012,8 @@ impl Endpoint {
             }
         }
     }
+    /// 一次监督轮询：先处理停止/已有实例，再为可运行任务走审批、准备和最终启动关口。
+    /// P0 同时只放行一个未确认停止的执行实例；Unknown 也占用执行位置。
     async fn tick(&self) -> std::result::Result<(), AnyError> {
         let tasks = self.store.list_tasks(None).await?;
         let mut active = tasks.iter().any(|t| {
@@ -997,6 +1023,7 @@ impl Endpoint {
             ) && t.stop_state != "confirmed"
         });
         for mut task in tasks {
+            // 终态任务只补做采集/清理；这些重试不经过用户命令的启动路径。
             if matches!(task.execution_state.as_str(), "exited" | "not_started") {
                 if self
                     .store
@@ -1061,6 +1088,8 @@ impl Endpoint {
                 task.finish_reason = Some(reason.into());
             }
             let backend = self.backend(&body);
+            // 停止优先于正常推进。没有实例引用也不代表未启动：starting/unknown
+            // 可能对应准备过程的崩溃窗口，只能继续保留未知证据。
             if matches!(task.stop_state.as_str(), "requested" | "failed" | "unknown") {
                 if let Some(instance) = &body.instance {
                     match backend.stop(instance, StopReason::Cancelled).await {
@@ -1131,6 +1160,7 @@ impl Endpoint {
                 }
                 continue;
             }
+            // 已存在或状态未知的实例仍占用执行位置，防止恢复期间并行放行新任务。
             if active {
                 continue;
             }
@@ -1187,6 +1217,7 @@ impl Endpoint {
             let rev = task.revision;
             task = self.update(task, rev).await?;
             drop(gate);
+            // 准备可能慢且有外部副作用，不在此期间持有 gate；落盘 starting 后，崩溃只能恢复核实。
             let prepared = match backend.prepare(body.resolved.clone()).await {
                 Ok(p) => p,
                 Err(error) => {
@@ -1234,6 +1265,7 @@ impl Endpoint {
             self.store
                 .put_record("runtime", &task.task_id, val(&prepared.instance)?)
                 .await?;
+            // prepare 期间允许撤销/取消推进；重新取锁并重读任务和 grant 后才能放行。
             let _gate = self.gate.lock().await;
             task = self
                 .store
@@ -1284,6 +1316,7 @@ impl Endpoint {
                     json!({"digest":task.effective_digest,"started_at":now()}),
                 )
                 .await?;
+            // 审批消费与启动尝试都已持久化才发许可；此后失败仍可能已启动，只能停止/核实。
             let permit = LaunchPermit::after_durable_authorization(
                 task.task_id.clone(),
                 body.resolved.digest.clone(),
@@ -1311,6 +1344,7 @@ impl Endpoint {
         }
         Ok(())
     }
+    /// 收集隔离输出/产物后清理运行资源，以持久标记支持后续轮询补做未完成步骤。
     async fn collect(
         &self,
         task: &StoredTask,
@@ -1632,6 +1666,7 @@ impl Endpoint {
             delay = (delay * 2).min(30);
         }
     }
+    /// 建立并固定对端身份，持久同步撤销后才标记 connected 并处理签名请求。
     async fn session(&self) -> std::result::Result<(), AnyError> {
         if self.trust_revoked.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("MCP_TRUST_REVOKED".into());
@@ -1690,6 +1725,7 @@ impl Endpoint {
             } => (*epoch, *service_revision, revoked_principals.clone()),
             _ => return Err("SYNC_REQUIRED".into()),
         };
+        // Ready 表示撤销已持久接收，所以必须在发 Ready 和开放请求处理之前完成。
         for principal in revoked {
             self.revoke_principal(&principal).await?;
         }
@@ -1702,21 +1738,85 @@ impl Endpoint {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut work = tokio::task::JoinSet::new();
         loop {
-            tokio::select! {biased;
-                _=tick.tick()=>{if self.trust_revoked.load(std::sync::atomic::Ordering::SeqCst){return Err("MCP_TRUST_REVOKED".into())}
-                    if last_seen.elapsed()>Duration::from_secs(15){return Err("CONTROL_LOST".into())}}
-                frame=orc_transport::receive(&mut ws)=>{match frame?{
-                    Frame::Ping{sequence}=>{last_seen=tokio::time::Instant::now();orc_transport::send(&mut ws,&Frame::Pong{sequence}).await?;}
-                    Frame::Revoke{principal_id,revision}=>{if revision<service_revision{return Err("SERVICE_REVISION_ROLLBACK".into())}self.revoke_principal(&principal_id).await?;service_revision=revision;orc_transport::send(&mut ws,&Frame::RevokeAck{principal_id,revision}).await?;},
-                    Frame::MaintenanceProbe{id}=>{let mut result=self.maintenance_status().await?;result["unresolved_tasks"]=json!(result["unresolved_tasks"].as_u64().unwrap_or(0)+work.len() as u64);orc_transport::send(&mut ws,&Frame::Response{id,result:Some(result),error:None}).await?;}
-                    Frame::Request{id,envelope}=>{
-                        envelope.verify(&key,&orc_protocol::EnvelopeContext{mcp_id:&McpId(self.config.mcp_id.clone()),device_id:&DeviceId(self.device_id.clone()),connection_epoch:epoch,service_policy_revision:service_revision,capabilities:&capabilities,now:now()})?;
-                        if work.len()>=8{orc_transport::send(&mut ws,&Frame::Response{id,result:None,error:Some("DEVICE_BUSY".into())}).await?;continue}
-                        let endpoint=self.clone();work.spawn(async move{let result=endpoint.invoke(envelope.payload.principal,&envelope.payload.operation,envelope.payload.request).await;(id,result)});
+            // 优先检查信任/心跳，再接收控制帧；业务处理放入有界 JoinSet，
+            // 避免单个工具调用占住读循环而阻塞撤销消息。
+            tokio::select! { biased;
+                _ = tick.tick() => {
+                    if self.trust_revoked.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err("MCP_TRUST_REVOKED".into())
                     }
-                    _=>return Err("INVALID_FRAME".into()),
-                }}
-                completed=work.join_next(),if !work.is_empty()=>{if let Some(Ok((id,result)))=completed{let frame=match result{Ok(v)=>Frame::Response{id,result:Some(v),error:None},Err(e)=>Frame::Response{id,result:None,error:Some(e.to_string())}};orc_transport::send(&mut ws,&frame).await?;}}
+                    if last_seen.elapsed() > Duration::from_secs(15) {
+                        return Err("CONTROL_LOST".into())
+                    }
+                }
+                frame = orc_transport::receive(&mut ws) => {
+                    match frame? {
+                        Frame::Ping { sequence } => {
+                            last_seen = tokio::time::Instant::now();
+                            orc_transport::send(&mut ws, &Frame::Pong { sequence }).await?;
+                        }
+                        Frame::Revoke { principal_id, revision } => {
+                            if revision < service_revision {
+                                return Err("SERVICE_REVISION_ROLLBACK".into())
+                            }
+                            // ACK 只确认持久撤销；停止核实由 supervise 独立推进。
+                            self.revoke_principal(&principal_id).await?;
+                            service_revision = revision;
+                            orc_transport::send(
+                                &mut ws,
+                                &Frame::RevokeAck { principal_id, revision }
+                            ).await?;
+                        },
+                        Frame::MaintenanceProbe { id } => {
+                            let mut result = self.maintenance_status().await?;
+                            result["unresolved_tasks"] = json!(
+                                result["unresolved_tasks"].as_u64().unwrap_or(0) + work.len() as u64
+                            );
+                            orc_transport::send(
+                                &mut ws,
+                                &Frame::Response { id, result: Some(result), error: None }
+                            ).await?;
+                        }
+                        Frame::Request { id, envelope } => {
+                            envelope.verify(&key, &orc_protocol::EnvelopeContext {
+                                mcp_id: &McpId(self.config.mcp_id.clone()),
+                                device_id: &DeviceId(self.device_id.clone()),
+                                connection_epoch: epoch,
+                                service_policy_revision: service_revision,
+                                capabilities: &capabilities,
+                                now: now()
+                            })?;
+                            if work.len() >= 8 {
+                                orc_transport::send(
+                                    &mut ws,
+                                    &Frame::Response {
+                                        id, result: None, error: Some("DEVICE_BUSY".into())
+                                    }
+                                ).await?;
+                                continue
+                            }
+                            let endpoint = self.clone();
+                            work.spawn(async move {
+                                let result = endpoint.invoke(
+                                    envelope.payload.principal,
+                                    &envelope.payload.operation,
+                                    envelope.payload.request
+                                ).await;
+                                (id, result)
+                            });
+                        }
+                        _ => return Err("INVALID_FRAME".into()),
+                    }
+                }
+                completed = work.join_next(), if !work.is_empty() => {
+                    if let Some(Ok((id, result))) = completed {
+                        let frame = match result {
+                            Ok(v) => Frame::Response { id, result: Some(v), error: None },
+                            Err(e) => Frame::Response { id, result: None, error: Some(e.to_string()) }
+                        };
+                        orc_transport::send(&mut ws, &frame).await?;
+                    }
+                }
             }
         }
     }
@@ -2085,6 +2185,8 @@ impl Endpoint {
             _ => Err("UNKNOWN_ADMIN_METHOD".into()),
         }
     }
+    /// 将本地审批映射为逐文件授权 guard，在阻塞文件操作期间保持授权锁存活。
+    /// 回写可能部分完成；返回各文件结果，不能把整批再次提交当作故障恢复。
     async fn apply_changes(&self, id: &str) -> std::result::Result<Value, AnyError> {
         let record = self
             .store
@@ -2166,6 +2268,8 @@ impl Endpoint {
                             .await
                             .map_err(|_| orc_workspace::WorkspaceError::ApprovalInvalid)?;
                     }
+                    // 把锁交给 ManagedWorkspace::apply 持有到实际文件修改结束；
+                    // 若这里只返回 ()，检查通过到 rename/unlink 之间会留下撤销窗口。
                     Ok(authorization)
                 })
             })?;

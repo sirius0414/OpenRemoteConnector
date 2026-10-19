@@ -1,5 +1,9 @@
-//! Owner-mediated, expiring enrollment. These public objects contain no secret
-//! keys. An invitation proves identity; it grants no device execution action.
+//! 所有者中转的十分钟登记材料，公开对象中不包含私钥。
+//!
+//! 设备签名 EnrollmentRequest，MCP 签发 Invitation，设备再签 EnrollmentProof 完成兑换。
+//! 邀请将双方身份、设备证书和期限绑定；单次消费由 Store 负责，验签本身不能防止重复兑换。
+//! 所有者仍须通过独立可信渠道核对 MCP 指纹；登记材料不授予任何执行动作。
+
 use super::{IdentityFile, Result, key_id, random_nonce, sign, valid_nonce, verify, verifying_key};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

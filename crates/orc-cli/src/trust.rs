@@ -1,4 +1,8 @@
-//! Change peer configuration only after the endpoint has durably revoked its old trust.
+//! 所有者 CLI 的信任切换：协调服务端权威状态和本地配置文件。
+//!
+//! 先写好私有候选配置，调用 endpoint 的 trust.set 成功后才替换生效配置。
+//! 若持久信任已提交但文件激活失败，保留候选文件供恢复，不能假装两处更新具有原子性。
+
 use super::{private_identity, rpc};
 use orc_transport::{AnyError, Invitation};
 use serde::Deserialize;
@@ -41,6 +45,7 @@ fn private_bytes(path: &Path) -> Result<Vec<u8>, AnyError> {
     }
     Ok(bytes)
 }
+/// 准备候选配置并请求终端提交信任；提交成功后才原子替换配置文件，要求重启激活。
 pub async fn set(
     config_path: &Path,
     invitation_path: &Path,

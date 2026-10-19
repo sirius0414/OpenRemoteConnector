@@ -1,8 +1,11 @@
-//! Durable, serialized state with a separately retained security journal.
+//! 串行持久化存储，以及独立保留的安全事实 journal。
 //!
-//! Keep `security-journal.jsonl` when restoring a database backup. Recovery
-//! replays security facts, never commands or processes. A damaged/missing
-//! journal is an error; callers must keep execution paused.
+//! `Store` 是异步队列句柄，`Database` 仅由专用线程使用；控制队列优先于普通请求，
+//! 为撤销、停止状态和恢复保留处理机会及容量。SQL 不在调用者的异步任务上执行。
+//! 安全事件按 journal 写入并同步 → SQLite 事务 → 更新内存序号的顺序提交。
+//! 恢复旧数据库时必须保留 `security-journal.jsonl`；重放只恢复安全事实，不能执行命令。
+//! journal 缺失或损坏时拒绝恢复；任务正文不写入任务事件的 journal 副本。
+
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -87,6 +90,7 @@ pub enum StoreError {
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// 去重范围是主体 × 设备 × submission_id；不能只按客户端生成的 ID 全局去重。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmissionKey {
@@ -103,6 +107,8 @@ pub struct SubmissionRecord {
     pub grant_id: String,
     pub created_at: u64,
 }
+/// 持久任务状态；revision 用于 CAS 更新，payload 是接受时固定的任务正文。
+/// 运行实例另存 runtime 记录，避免状态推进顺便改变已批准的命令内容。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredTask {
@@ -133,6 +139,7 @@ pub struct StoredGrant {
     pub status: String,
     pub payload: Value,
 }
+/// 一次性审批，绑定有效内容摘要及 grant/policy 版本，不能移用到其他内容。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredApproval {
@@ -162,6 +169,7 @@ pub struct AuditEvent {
     pub outcome: String,
 }
 
+/// 有界异步存储接口；入队完成后丢弃响应接收者不会撤销数据库操作。
 #[derive(Clone)]
 pub struct Store {
     normal: mpsc::Sender<Job>,
@@ -298,6 +306,8 @@ impl Store {
         self.accept_submission_with_approval(submission, task, None)
             .await
     }
+    /// 一次提交去重记录、任务及可选待审批记录；重复请求返回已有任务。
+    /// 这一步仅确认接受，不消费审批、不启动外部进程。
     pub async fn accept_submission_with_approval(
         &self,
         submission: SubmissionRecord,
@@ -320,6 +330,7 @@ impl Store {
         self.call(Operation::Tasks(principal_id.map(str::to_owned)), false)
             .await
     }
+    /// 以 expected_revision 做 CAS；身份、有效摘要、原始正文和创建时间不可随状态更新改变。
     pub async fn update_task(
         &self,
         task: StoredTask,
@@ -346,6 +357,7 @@ impl Store {
         self.call(Operation::DecideApproval(id.into(), approve, now), true)
             .await
     }
+    /// 启动前单次消费审批；同时核对摘要、版本、期限及关联任务。
     #[allow(clippy::too_many_arguments)]
     pub async fn consume_approval(
         &self,
@@ -398,10 +410,12 @@ impl Store {
     pub async fn audit(&self, event: AuditEvent) -> Result<()> {
         self.call(Operation::Audit(event), false).await
     }
+    /// 仅备份 SQLite；恢复时还需保留当前安全 journal，不能用旧备份覆盖它。
     pub async fn backup(&self, destination: impl AsRef<Path>) -> Result<()> {
         self.call(Operation::Backup(destination.as_ref().to_owned()), false)
             .await
     }
+    /// 将邀请消费与设备登记写成同一个安全事件，避免只完成一半后可重复兑换。
     pub async fn redeem_invitation(
         &self,
         nonce: &str,
@@ -605,6 +619,7 @@ impl Database {
                     "security journal chain is invalid".into(),
                 ));
             }
+            // 数据库备份可能落后 journal；只补齐缺失安全事实，恢复模式会剥夺任务启动资格。
             if entry.sequence > high_water {
                 connection.execute_batch("BEGIN IMMEDIATE")?;
                 let applied = apply_event(&connection, &entry.event, true).and_then(|()| {
@@ -640,6 +655,8 @@ impl Database {
             limits,
         })
     }
+    /// 先同步 journal，再应用 SQLite 事务；任何中途错误都要求重新打开存储恢复。
+    /// 不能简单重试 SQL 或继续用旧内存序号，否则可能再次接受已消费的权限。
     fn commit(&mut self, event: SecurityEvent) -> Result<()> {
         if self.failed {
             return Err(StoreError::SecurityState(
@@ -650,6 +667,7 @@ impl Database {
             .sequence
             .checked_add(1)
             .ok_or(StoreError::QuotaExceeded)?;
+        // SQLite 保留受保护任务正文；长期 journal 只留摘要与状态，避免恢复时还原敏感正文。
         let mut journal_event = event.clone();
         match &mut journal_event {
             SecurityEvent::Accepted { task, .. } | SecurityEvent::Task { task } => {
@@ -691,6 +709,7 @@ impl Database {
         self.failed = false;
         Ok(())
     }
+    /// 普通新增工作在高水位处被拒绝，为控制操作保留到硬上限之间的空间。
     fn require_headroom(&self) -> Result<()> {
         let pages: u64 = self
             .connection
@@ -767,6 +786,7 @@ impl Database {
                 )?)
             }
             Operation::Accept(submission, task, approval) => {
+                // 必须先查已有接受记录再检查容量和新任务约束，保证重试仍返回原决定。
                 if let Some(existing) = self.submission(&submission.key)? {
                     if existing.request_digest != submission.request_digest {
                         return Err(StoreError::SubmissionConflict);
@@ -1119,6 +1139,7 @@ fn write_task(connection: &Connection, task: &StoredTask) -> Result<()> {
     connection.execute("INSERT INTO tasks VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,body=excluded.body",params![task.task_id,task.principal_id,task.device_id,task.grant_id,task.revision,body(task)?])?;
     Ok(())
 }
+/// 同一事件用于正常提交与恢复；恢复中的任务只还原事实，绝不重新获得启动资格。
 fn apply_event(connection: &Connection, event: &SecurityEvent, recovery: bool) -> Result<()> {
     match event {
         SecurityEvent::TaskBodyExpired { task_id, now } => {

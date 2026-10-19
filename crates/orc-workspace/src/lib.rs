@@ -1,8 +1,11 @@
-//! Text snapshots and exact-content changes for explicitly managed workspaces.
+//! 文本快照、内容寻址对象，以及受管工作区中的精确内容回写。
 //!
-//! Path traversal uses directory descriptors and refuses links. Linux additionally
-//! uses `openat2` with BENEATH/NO_SYMLINKS/NO_XDEV. Workspace locks coordinate ORC
-//! and participating editors; they do not constrain arbitrary same-UID programs.
+//! 阅读顺序：ObjectStore → Snapshot/Scan → ChangeSet → ManagedWorkspace::apply。
+//! 快照冻结获准字节；回写先校验整个基线，再消费审批，逐文件获取授权并记录结果。
+//! 通过目录 FD 遍历并拒绝链接；Linux 另用 openat2 限制 BENEATH/NO_SYMLINKS/NO_XDEV。
+//! 工作区锁只协调 ORC 和遵守约定的编辑器，不能约束同 UID 的任意程序。
+//! 单文件替换不代表跨文件事务；失败或撤销后的部分结果必须保留供人工核对。
+
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, renameat, unlinkat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -110,6 +113,7 @@ pub struct ExcludedFile {
     pub path: String,
     pub reason: String,
 }
+/// 不可变路径到内容摘要的清单；读取来自对象库，不再次读取可变的宿主源文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -122,6 +126,7 @@ pub struct Snapshot {
     pub total_bytes: u64,
 }
 
+/// 以 SHA-256 命名的有界文本对象库；读取时复核摘要，调用方负责授权与留存引用。
 #[derive(Clone)]
 pub struct ObjectStore {
     directory: PathBuf,
@@ -323,6 +328,7 @@ impl Scan<'_> {
             reason: reason.into(),
         });
     }
+    /// 通过已打开的目录 FD 扫描；同时限制访问条目数与有效文件数，排除项也计入扫描预算。
     fn walk(&mut self, directory: &File, prefix: &str, depth: usize) -> Result<()> {
         if depth > self.limits.max_depth {
             return Err(WorkspaceError::QuotaExceeded);
@@ -419,6 +425,7 @@ pub struct Change {
     pub before: Option<BlobRef>,
     pub after: Option<BlobRef>,
 }
+/// 绑定工作区身份和逐文件 before/after 的差异；摘要覆盖整批内容供本地审批。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeSet {
@@ -597,6 +604,9 @@ impl ManagedWorkspace {
         lock.try_lock().map_err(|_| WorkspaceError::NotExclusive)?;
         Ok(WorkspaceGuard { lock })
     }
+    /// 在工作区排他锁下校验全量基线和对象，消费一次审批，再逐文件检查授权并修改。
+    /// authorize 返回的 guard 保持到该文件落盘及结果记录完成；中途失败只报告部分结果。
+    /// 已经创建批次 journal 的尝试不能重放，应使用 reconcile 核对当前内容。
     pub fn apply<G>(
         &self,
         changes: &ChangeSet,
@@ -652,6 +662,7 @@ impl ManagedWorkspace {
                 temporary,
             });
         }
+        // 批次 journal 是永久防重放标记；创建后即使审批消费失败，也必须核对结果而非重复写入。
         let mut journal = open_file_at(
             &self.root,
             &journal_name,
@@ -928,6 +939,7 @@ fn open_file_at(root: &File, name: &str, flags: OFlags, mode: u32) -> Result<Fil
     .map_err(io_error)?;
     Ok(fd.into())
 }
+/// 逐级固定父目录 FD 后返回叶名；后续 rename/unlink 相对此 FD 操作，不重新拼接绝对路径。
 fn parent_and_leaf(root: &File, path: &str) -> Result<(File, String)> {
     validate_path(path)?;
     let mut parts = path.split('/').collect::<Vec<_>>();

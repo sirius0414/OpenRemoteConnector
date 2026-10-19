@@ -1,5 +1,9 @@
-//! Platform independent authorization and task contracts.
-//! Names and client supplied labels never establish an identity.
+//! 平台无关的身份、授权、规则和任务状态契约。
+//!
+//! 阅读顺序：`Principal` 确定主体 → `Grant` 限定权限 → `Policy` 决定是否审批 →
+//! `ExecutionState` / `StopState` 描述执行证据。这里不访问数据库或启动进程。
+//! 调用方先用本模块检查请求，再由 endpoint 解析实际入口、持久化决定并执行；
+//! 客户端名称、请求自带的标签和 OAuth 登录本身都不能替代本地 grant。
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -74,6 +78,8 @@ impl SubmissionId {
     }
 }
 
+/// 服务端建立的稳定主体；由 MCP、认证域、所有者和客户端登记共同确定。
+/// 刷新令牌或重连不改变身份，重新登记得到的新身份不继承旧授权。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Principal {
@@ -148,6 +154,8 @@ pub enum GrantStatus {
     Suspended,
 }
 
+/// 终端所有者授予的有限权限，绑定主体、设备、普通 UID、环境与期限。
+/// revision 发生语义变化时必须使旧审批失效；请求不能自行扩展该范围。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
@@ -163,7 +171,9 @@ pub struct Grant {
     pub workspace_ids: BTreeSet<String>,
     pub allowed_env: BTreeSet<String>,
     pub policy: Policy,
+    /// 授权语义版本；更新后旧版本绑定的审批不能继续使用。
     pub revision: u64,
+    /// Unix 秒；有效区间为 [issued_at, expires_at)。
     pub issued_at: u64,
     pub expires_at: u64,
     pub status: GrantStatus,
@@ -209,6 +219,7 @@ impl Grant {
         self.policy.validate()
     }
 
+    /// 检查动作、主体、设备和 grant 当前有效性；正文读取也需在读取时重新调用。
     pub fn check_access(
         &self,
         principal: &PrincipalId,
@@ -240,6 +251,8 @@ impl Grant {
         Ok(())
     }
 
+    /// 在基础权限之外检查执行上下文和环境覆盖；不负责解析程序或评估规则。
+    /// 规则必须在 endpoint 固定实际入口后评估，避免按用户提供的程序名称放行。
     pub fn authorize(
         &self,
         principal: &PrincipalId,
@@ -304,12 +317,16 @@ impl Grant {
         Ok(())
     }
 
+    /// 任务运行期限由 grant 到期时间和请求时长共同限制（返回 Unix 秒）。
+    /// 投递信封、OAuth token 和请求接受窗口的到期不直接用作已运行任务的期限。
     pub fn deadline(&self, request: &TaskRequest, now: u64) -> u64 {
         self.expires_at
             .min(now.saturating_add(request.limits.wall_time_ms.div_ceil(1000)))
     }
 }
 
+/// Agent 可提交的任务内容，也是重试去重摘要的输入。
+/// 不包含可覆盖认证主体的字段；真实入口与最终环境由 endpoint 另行解析。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRequest {
@@ -663,7 +680,9 @@ pub enum ArgsMatch {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PositionMatch {
+    /// 从零开始的参数位置，匹配字面值，不进行 shell 展开。
     pub values: BTreeMap<usize, String>,
+    /// 为 false 时必须完整覆盖连续参数位置，不能留下未约束的额外参数。
     pub allow_extra: bool,
 }
 impl ArgsMatch {
@@ -758,6 +777,7 @@ pub struct RuleMatch {
     pub args: ArgsMatch,
 }
 
+/// 解析后的规则匹配输入；program 是实际入口摘要，cwd 是执行使用的目录。
 pub struct RuleContext<'a> {
     pub principal: &'a PrincipalId,
     pub device: &'a DeviceId,
@@ -874,6 +894,8 @@ impl RuleSet {
         Ok(())
     }
 
+    /// 匹配全部规则后按 deny > review > allow 合并，规则排列顺序不影响结果。
+    /// 没有匹配项时只允许拒绝或待审批，不能隐式自动放行。
     pub fn evaluate(&self, c: &RuleContext<'_>) -> PolicyDecision {
         // Fail closed even if a caller skipped validate() during policy installation.
         if self.validate().is_err() || c.program.is_empty() {
@@ -912,6 +934,7 @@ impl RuleSet {
     }
 }
 
+/// 执行状态描述已知进展；Unknown 表示副作用不确定，不能作为重试启动的理由。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionState {
@@ -927,6 +950,7 @@ impl ExecutionState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Exited | Self::NotStarted)
     }
+    /// 只允许向前推进或保持原态；Unknown 只能核实为终态，不能回到可启动状态。
     pub fn can_transition_to(self, next: Self) -> bool {
         self == next
             || matches!(
@@ -946,6 +970,7 @@ impl ExecutionState {
     }
 }
 
+/// 与执行状态独立的停止证据；Requested 是意图，Confirmed 需要后端核实。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StopState {

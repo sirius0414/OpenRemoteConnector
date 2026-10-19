@@ -1,0 +1,65 @@
+{
+  "date_local": "2026-10-19",
+  "timezone": "Asia/Shanghai",
+  "baseline_commit": "7f18065b388fd4473df239b10035cfa980783526",
+  "github_clone": {
+    "status": "passed",
+    "repository": "https://github.com/sirius0414/OpenRemoteConnector.git",
+    "path": "/home/cloudapp/orc-p0/source"
+  },
+  "aliyun": {
+    "os": "Ubuntu 24.04.2 LTS",
+    "arch": "x86_64",
+    "user": "cloudapp",
+    "uid": 1001,
+    "systemd_user_manager": "running",
+    "script_syntax": "passed_on_local_and_aliyun",
+    "prerequisites_except_rust": "passed"
+  },
+  "rust_bootstrap": {
+    "status": "blocked",
+    "reason": "Official installer transfer stalled/timed out; installer session terminated",
+    "range_probe": {
+      "exit_code": 28,
+      "seconds": 20,
+      "bytes_received": 316495,
+      "bytes_expected": 1048576
+    },
+    "http1_probe": {
+      "exit_code": 28,
+      "seconds": 45,
+      "bytes_received": 752223,
+      "bytes_expected": 21113232
+    }
+  },
+  "nas_ssh": {
+    "address": "127.0.0.1:26022 (from Aliyun)",
+    "attempted_user": "cloudapp",
+    "transport_reachable": true,
+    "authenticated": false,
+    "result": "Permission denied (publickey)",
+    "os_verified": false
+  },
+  "mcp_build": "not_run",
+  "mcp_service": "not_started",
+  "endpoint_service": "not_started",
+  "native_client_oauth": "not_run",
+  "two_machine_task": "not_run",
+  "gvisor": "not_configured",
+  "public_https_config": "prepared_not_installed",
+  "reason": "Remote Desktop Commander blocks sudo; existing reverse proxy unchanged",
+  "source_archive_upload": "rejected_by_automatic_review; subsequently used user-requested public GitHub clone",
+  "script_sha256": {
+    "aliyun-mcp.sh": "bfdf79821572bb705cfcfa9765f17937af268e32b276f6c7463c2f665157591e",
+    "bootstrap-user.sh": "320a488f76edffda8533a30418413e96897e44b0c43cdd6dd6f0c144ee264331",
+    "common.sh": "5140285459ea306209de99662a80781bc18bb9e889d7e116ca5455b35473fda0",
+    "configure-endpoint.sh": "b803ea15bd39dd17cfb89bd376859394dd3a8be7cb9aef9cc4d560cfec0d4762",
+    "install-nginx.sh": "5887217b4224ceb4efe89c5d3767f60c9518a9c1abe6331a3341bd19255b7bdf",
+    "nas-endpoint.sh": "f3812c0ebe3089051a399e448385fe658b4b6902c3be00ad0aed252a8d4f4433",
+    "service.sh": "2b4fabc020e06f2b52b2130e08de84cb17625b38a522865db78c0db75fdb30fb",
+    "sign-client.sh": "7cd296213c33dba161647e05514f1b677b3c21de96d76a1301a0cf6a94c35d27",
+    "smoke-mcp.py": "ff6acc2c22b9de0f69cd19897a40fdfdcd2bddd26312f00c515a86eda1bbdc61",
+    "test-linux.sh": "274ddf47a02eb1786b0e65cf8566193b712eb71d792df7c14b812c6190d8f33d"
+  },
+  "release_acceptance_passed": false
+}

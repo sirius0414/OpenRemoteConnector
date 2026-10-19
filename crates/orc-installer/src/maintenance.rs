@@ -1,5 +1,10 @@
-//! Maintenance swaps programs only. State databases and security journals never
-//! move backwards. Live preparation is performed by the authoritative services.
+//! 升级、回退和卸载的所有者维护流程。
+//!
+//! 验证并暂存包 → 请求维护暂停/停止证据与备份 → 停服务 → 切换程序链接 → 恢复服务。
+//! 离线模式仅支持能读取本地停止证据的 endpoint；MCP 离线不能证明远端任务已停止。
+//! 回退只切换程序，不还原安全状态；journal 和状态目录保留，防止撤销或审批消费被回滚。
+//! 部分失败写维护记录供恢复，不能把程序链接回滚等同于整个维护操作的原子回滚。
+
 use super::*;
 use orc_admin::Request;
 use std::time::Duration;
@@ -312,6 +317,8 @@ fn event(journal: &mut File, value: Value) -> Result<()> {
 /// Offline mode currently supports endpoint-only maintenance: the exclusive
 /// store lock and terminal task evidence are required. An offline MCP cannot
 /// confirm remote tasks, so it must use live preparation.
+/// 协调角色维护及程序链接切换；所有状态与安全 journal 原位保留。
+/// 停止未确认时禁止切换，部分完成后的恢复线索写入独立维护 journal。
 pub async fn maintain(
     root: &Path,
     role: Role,

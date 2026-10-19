@@ -1,4 +1,10 @@
-//! Bounded mutual-TLS device transport. No insecure certificate verifier exists.
+//! 设备出站连接共用的身份、mTLS、握手和有界 WebSocket 帧。
+//!
+//! TLS 认证证书，应用层签名证明 ORC 身份密钥；调用方还要核对登记的证书指纹。
+//! Hello 携带设备随机数，Sync 绑定该随机数、连接代数和撤销集合，Ready 回签整个同步摘要。
+//! 服务端验证 Ready 后才发布连接，终端必须持久处理 Sync 中的撤销后才发送 Ready。
+//! 普通业务请求另外使用 orc-protocol 的签名信封，连接建立不等于执行授权。
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
@@ -34,6 +40,7 @@ pub struct TlsFiles {
     pub key: PathBuf,
     pub ca: PathBuf,
 }
+/// 本机 Ed25519 私钥文件；只输出公钥和派生 ID，加载时检查文件归属及权限。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityFile {
@@ -136,6 +143,7 @@ pub fn hello() -> Hello {
         capabilities: capabilities(),
     }
 }
+/// 设备通道上的严格消息类型；握手、请求响应、心跳和撤销各自有独立语义。
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Frame {
@@ -238,6 +246,7 @@ fn sync_payload(frame: &Frame) -> Result<Value> {
         json!({"purpose":"orc-device-sync-v1","mcp_id":mcp_id,"public_key":public_key,"epoch":epoch,"service_revision":service_revision,"revoked_principals":revoked_principals,"hello":hello,"device_nonce":device_nonce,"challenge":challenge}),
     )
 }
+/// 签名完整同步上下文并回显设备 nonce，防止旧 Sync 被用于新连接。
 pub fn sync_frame(
     identity: &IdentityFile,
     hello_frame: &Frame,
@@ -313,6 +322,7 @@ fn ready_payload(sync: &Frame) -> Result<Value> {
         json!({"purpose":"orc-device-ready-v1","mcp_id":mcp_id,"epoch":epoch,"device_nonce":device_nonce,"challenge":challenge,"sync_digest":orc_protocol::canonical_digest(&sync_payload(sync)?)?}),
     )
 }
+/// 回签 Sync 摘要；调用方必须已持久应用撤销，构造签名本身不执行该持久化。
 pub fn ready_frame(identity: &IdentityFile, sync: &Frame) -> Result<Frame> {
     let Frame::Sync { epoch, .. } = sync else {
         return Err("SYNC_REQUIRED".into());
@@ -322,6 +332,7 @@ pub fn ready_frame(identity: &IdentityFile, sync: &Frame) -> Result<Frame> {
         signature: sign(identity, &ready_payload(sync)?)?,
     })
 }
+/// 验证当前握手的设备持钥证明；epoch 与同步摘要都必须匹配，不能只验证签名格式。
 pub fn verify_ready(ready: &Frame, sync: &Frame, expected_device_public_key: &str) -> Result<()> {
     let Frame::Ready { epoch, signature } = ready else {
         return Err("READY_REQUIRED".into());

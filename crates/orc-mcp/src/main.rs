@@ -1,3 +1,7 @@
+//! MCP 进程入口：分别启动 Agent HTTP、设备 mTLS 和所有者管理 socket。
+//!
+//! HTTP 监听仅用于回环/反向代理入口，设备 TLS 在服务内终止；本进程不执行用户命令。
+
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
 #[derive(Parser)]

@@ -1,5 +1,10 @@
-//! Role-specific initialization and verified offline binary installation.
-//! No remote script, post-install hook, or implicit privilege escalation runs.
+//! 角色初始化、离线发行包验证和首次安装。
+//!
+//! setup 只生成私有目录、身份和配置，不自动建立对端信任或执行 grant。
+//! verify_release 使用所有者独立提供的公钥验证原始 manifest 字节及所选二进制摘要。
+//! install_release 支持初装和相同版本重复安装；运行中角色的版本切换交给 maintenance。
+//! 不运行远程脚本、安装钩子或隐式提权操作。
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use orc_transport::IdentityFile;
@@ -88,6 +93,7 @@ pub struct DoctorReport {
     pub cloud_client_verified: bool,
 }
 
+/// 幂等生成所选角色的私有布局；已有身份和配置保留，缺证书/授权时仍不可执行。
 pub fn setup(root: &Path, role: Role, public_url: &str) -> Result<SetupReport> {
     if !root.is_absolute() {
         return Err("setup root must be an absolute path".into());
@@ -335,6 +341,7 @@ fn verify_binary(path: &Path, entry: &ReleaseFile) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+/// 验证所选二进制后安装；已运行角色的不同版本切换必须走维护暂停流程。
 pub fn install_release(
     root: &Path,
     bundle: &Path,
@@ -426,6 +433,7 @@ pub fn install_release(
     )
 }
 
+/// 报告本机可观察的配置和依赖状态；本地成功不能证明公网入口或真实客户端可达。
 pub fn doctor(root: &Path) -> Result<DoctorReport> {
     let mut checks = vec![
         Check {

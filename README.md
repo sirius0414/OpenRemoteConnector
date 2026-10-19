@@ -36,7 +36,9 @@ MCP 和终端各有独立 SQLite 与安全 journal。设备主动连接 MCP 的�
 ## 文档与样例
 
 - [PRD](docs/PRD.md)、[架构契约](docs/ARCHITECTURE.md)、[详细设计](docs/DESIGN.md)
+- [P0 代码阅读与 review 指南](docs/CODE_REVIEW.md)：调用链、锁与持久化边界、状态语义和注释约定
 - [当前验证与缺口](docs/validation/P0-STATUS.md)、[执行后端验证](docs/validation/EXECUTION.md)
+- [Aliyun MCP + NAS 虚拟机测试环境](docs/validation/ALIYUN-NAS-P0.md)（含部署脚本、插件接入与实测阻碍）
 - [实现决策与偏离](docs/decisions/0001-rust-implementation.md)
 - [Agent 单入口 Skill](skills/orc/SKILL.md)
 - [离线工作流样例](examples/README.md)、[Python 环境](environments/python/README.md)

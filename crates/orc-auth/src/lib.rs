@@ -1,8 +1,11 @@
-//! Persistent single-owner OAuth with local consent and oxide-auth PKCE.
+//! 单所有者 OAuth：本地同意、PKCE、单次授权码和刷新令牌轮换。
 //!
-//! A bounded actor owns the state. Once queued, consent, code consumption and
-//! refresh rotation survive a caller disconnect; a committed operation cannot
-//! leave a stale in-memory copy that accepts the same credential again.
+//! 流程为 register → begin → 本地 approve → 浏览器 complete → exchange；
+//! authenticate 返回由服务端登记信息构造的 Principal，不接受客户端指定身份。
+//! 有界 actor 串行拥有 State；写操作先修改副本、持久化成功后才发布新内存状态。
+//! 请求入队后即使 HTTP 断开也会完成消费，防止同一凭据因响应丢失而再次可用。
+//! 登录同意只建立身份；设备访问和执行权限分别由 MCP 与 endpoint 继续检查。
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use orc_domain::{McpId, Principal};
 use orc_store::Store;
@@ -109,6 +112,7 @@ struct Actor {
     sender: mpsc::Sender<Job>,
     _worker: JoinHandle<()>,
 }
+/// 可克隆的 actor 句柄；所有克隆共享同一凭据状态和串行消费顺序。
 #[derive(Clone)]
 pub struct Auth {
     actor: Arc<Actor>,
@@ -172,6 +176,7 @@ fn pkce_challenge(
 }
 
 impl Auth {
+    /// 加载持久 OAuth 状态并启动唯一写入 actor；存储结果不确定时停止服务凭据请求。
     pub async fn open(
         store: Store,
         resource: String,
@@ -199,6 +204,7 @@ impl Auth {
             while let Some(job) = receiver.recv().await {
                 let mut next = state.clone();
                 let mut result = (job.mutation)(&mut next);
+                // 刷新令牌重放虽然对外失败，却带有必须提交的家族撤销，不能丢弃 next。
                 let must_commit = job.write
                     && (result.is_ok() || matches!(result, Err(AuthError::ReplayedRefresh)));
                 if must_commit {
@@ -256,6 +262,7 @@ impl Auth {
         serde_json::from_value(value).map_err(|_| AuthError::Storage)
     }
 
+    /// 创建独立客户端登记 ID；显示名称相同也不合并身份或继承旧权限。
     pub async fn register(&self, name: String, redirects: Vec<String>, now: u64) -> Result<Client> {
         if name.is_empty()
             || name.len() > 128
@@ -293,6 +300,7 @@ impl Auth {
         .await
     }
 
+    /// 校验资源/redirect/PKCE，创建待所有者同意记录，并返回绑定浏览器的 nonce。
     pub async fn begin(&self, request: Authorization, now: u64) -> Result<(PendingLogin, String)> {
         pkce_challenge(&request)?;
         let resource = self.resource.clone();
@@ -349,6 +357,7 @@ impl Auth {
         .await
     }
 
+    /// 仅标记本地同意；浏览器仍需持有 begin 返回的 nonce 才能领取授权码。
     pub async fn approve(&self, id: &str, now: u64) -> Result<()> {
         let id = id.to_owned();
         self.call(true, move |state| {
@@ -362,6 +371,7 @@ impl Auth {
         .await
     }
 
+    /// 消费已批准且 nonce 匹配的登录，签发短期单次授权码及回跳地址。
     pub async fn complete(&self, id: &str, nonce: &str, now: u64) -> Result<String> {
         let id = id.to_owned();
         let nonce_digest = digest(nonce);
@@ -445,6 +455,7 @@ impl Auth {
         })
     }
 
+    /// PKCE、客户端、资源和 redirect 全部匹配后，在同一次 actor 写入中消费码并发令牌。
     #[allow(clippy::too_many_arguments)]
     pub async fn exchange(
         &self,
@@ -499,6 +510,8 @@ impl Auth {
         .await
     }
 
+    /// 轮换刷新令牌并沿用家族的绝对到期时间；重用旧令牌撤销整个家族。
+    /// 重放返回错误，但撤销必须先持久化，不能按普通失败丢弃状态副本。
     pub async fn refresh(
         &self,
         client: &str,
@@ -546,6 +559,7 @@ impl Auth {
         .await
     }
 
+    /// 只接受有效访问令牌，从登记记录构造 Principal；不信任请求中的身份字段。
     pub async fn authenticate(&self, token: &str, now: u64) -> Result<Principal> {
         let token_digest = digest(token);
         let resource = self.resource.clone();

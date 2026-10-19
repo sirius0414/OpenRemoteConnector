@@ -1,6 +1,10 @@
-//! Linux host execution through systemd user units. The command-line adapter is
-//! deliberately small and uses argv, never a shell. It is replaceable by zbus
-//! without changing the endpoint/runner lifecycle contract.
+//! 通过 systemd 用户服务监督 Linux 宿主任务。
+//!
+//! prepare 创建等待 gate 的 runner 服务，start 持久写入单次 gate，inspect/stop 核实原实例。
+//! 任务 ID 派生固定 unit 名，boot_id、InvocationID 与 cgroup 共同避免误认或误停其他进程。
+//! 宿主模式使用执行账户真实权限，工作目录不是文件隔离；非 Linux 平台直接拒绝执行。
+//! 当前固定 argv 的 CLI 适配保留后续替换为 zbus 的契约边界。
+
 use async_trait::async_trait;
 use orc_execution::*;
 use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -180,6 +184,7 @@ impl ExecutionBackend for HostBackend {
             ],
         })
     }
+    /// 先落盘规格和原实例身份，再创建等待 gate 的 systemd 服务；失败可能留下待核实实例。
     async fn prepare(&self, resolved: ResolvedSpec) -> Result<PreparedInstance, BackendError> {
         self.check_platform()?;
         resolved.validate_digest()?;
@@ -267,6 +272,7 @@ impl ExecutionBackend for HostBackend {
         refresh_lease(&instance)?;
         Ok(PreparedInstance { resolved, instance })
     }
+    /// 持有跨进程控制锁，拒绝停止意图，消费许可后写单次 gate 放行 runner。
     async fn start(
         &self,
         prepared: PreparedInstance,
@@ -294,6 +300,7 @@ impl ExecutionBackend for HostBackend {
         write_new_json(&instance.directory.join("gate.json"), &instance.spec_digest)?;
         Ok(instance)
     }
+    /// 结合原启动身份、unit 状态和 cgroup 判断执行证据；查询失败不代表进程消失。
     async fn inspect(&self, instance: &InstanceRef) -> Result<RuntimeEvidence, BackendError> {
         self.validate_metadata(instance)?;
         if !self.current_boot(instance)? {
@@ -355,6 +362,7 @@ impl ExecutionBackend for HostBackend {
             detail: format!("systemd ActiveState={active}; managed unit only"),
         })
     }
+    /// 只停止原 boot/InvocationID 对应服务，并以服务非活动且 cgroup 空确认结束。
     async fn stop(
         &self,
         instance: &InstanceRef,

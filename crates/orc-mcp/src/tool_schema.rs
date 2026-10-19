@@ -1,3 +1,8 @@
+//! Agent 工具目录与参数结构的共同入口。
+//!
+//! input_schema 生成展示给客户端的 schema，validate_arguments 在转发前实际解码校验。
+//! 新增工具需同时更新两处分派；schema 展示不能替代 endpoint 的授权和状态检查。
+
 use orc_domain::TaskRequest;
 use orc_transport::AnyError;
 use rmcp::model::{Tool, ToolAnnotations};

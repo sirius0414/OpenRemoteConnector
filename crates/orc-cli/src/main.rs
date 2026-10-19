@@ -1,4 +1,9 @@
-//! Owner CLI: all authority-changing operations use the local UID-checked socket.
+//! 所有者 CLI：本地初始化、身份材料、维护命令及管理 RPC 的入口。
+//!
+//! run 将子命令路由到 installer 或 admin socket；grant、审批和任务控制由服务端决定。
+//! workspace edit 为前台编辑器保留工作区锁，避免与自动回写同时修改受管目录。
+//! 外部内容经 JSON 序列化后输出，终端不直接解释任务输出中的控制字符。
+
 mod enrollment;
 mod trust;
 use clap::{Parser, Subcommand, ValueEnum};

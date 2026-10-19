@@ -1,6 +1,11 @@
-//! Execution boundary shared by the endpoint and its independently supervised runners.
-//! A backend never infers authorization; the endpoint must durably record acceptance
-//! and consume approval before issuing the non-cloneable launch permit.
+//! endpoint、执行后端、runner 和 watchdog 共用的执行契约。
+//!
+//! `ExecutionSpec` 是输入，`ResolvedSpec` 固定入口身份，`InstanceRef` 标识实际运行实例。
+//! 生命周期为 probe → prepare → start → inspect/stop → cleanup；prepare 可以创建等待实例，
+//! 只有 start 消费 `LaunchPermit` 后才放行用户命令。调用方负责事先持久化授权和启动尝试。
+//! 进程内 permit、跨进程控制锁和磁盘上的单次标记分别处理复用、并发停止和崩溃重放。
+//! 控制命令失败可能已产生外部副作用，必须保留 Unknown 并核实原实例。
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -59,6 +64,7 @@ pub enum ExecutionCommand {
         args: Vec<String>,
     },
 }
+/// 已选定 UID、cwd、显式环境和预算的执行输入；不从服务进程继承用户环境。
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionSpec {
@@ -147,6 +153,7 @@ impl ExecutionSpec {
     }
 }
 
+/// 已打开 ELF 入口的路径、文件身份和内容摘要；runner 在执行前再次比较。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EntryIdentity {
@@ -157,6 +164,7 @@ pub struct EntryIdentity {
     pub modified_ns: u128,
     pub sha256: String,
 }
+/// 供审批与启动绑定的有效执行规格，包含解析后的入口、cwd 身份和环境摘要。
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedSpec {
@@ -180,6 +188,8 @@ pub fn unix_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+/// 从当前文件游标读取完整 ELF 并取摘要，调用方应传入刚打开、游标为零的文件。
+/// 读取前后核对元数据；仅解释器入口走 ELF 校验，脚本字节单独冻结。
 pub fn inspect_entry_file(
     file: &mut fs::File,
     path: PathBuf,
@@ -234,6 +244,7 @@ pub fn inspect_entry_file(
         sha256: format!("{:x}", hash.finalize()),
     })
 }
+/// 按规格内的 PATH 解析宿主程序，固定入口与 cwd 身份并计算有效摘要。
 pub fn resolve_spec(mut spec: ExecutionSpec) -> Result<ResolvedSpec, BackendError> {
     spec.validate(unix_ms())?;
     let program = match &spec.command {
@@ -332,13 +343,17 @@ pub enum BackendKind {
     HostLinux,
     Gvisor,
 }
+/// 持久运行实例身份，供 endpoint 重启恢复及独立 watchdog 使用。
+/// invocation_id 绑定实际 systemd 调用或不可变容器 ID，不能仅凭运行时名称停止任务。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceRef {
     pub task_id: String,
     pub backend: BackendKind,
     pub runtime_id: String,
+    /// 原宿主启动周期；系统重启后不能按同名服务去停止新的实例。
     pub boot_id: String,
+    /// prepare 早期可为空，随后固定为 systemd InvocationID 或不可变容器 ID。
     pub invocation_id: String,
     #[serde(default)]
     pub cgroup_path: String,
@@ -350,14 +365,15 @@ pub struct PreparedInstance {
     pub resolved: ResolvedSpec,
     pub instance: InstanceRef,
 }
+/// 一次启动的进程内许可，按值消费且不可 Clone；跨重启防重放还依赖持久标记。
 pub struct LaunchPermit {
     task_id: String,
     digest: String,
 }
 impl LaunchPermit {
-    /// Call only from the endpoint's serialized authorization scheduler AFTER its
-    /// durable launch-attempt/approval transaction. Ownership prevents local reuse;
-    /// the backend's persistent start marker prevents replay after a crash.
+    /// 仅由 endpoint 的串行授权调度器调用：先持久消费审批（如需），再持久记录启动尝试。
+    /// 两次写入不是一个跨后端事务；中途崩溃只能核实/停止，不能自动重跑。
+    /// 所有权阻止进程内复用，后端的持久启动标记阻止崩溃后重放。
     pub fn after_durable_authorization(task_id: String, digest: String) -> Self {
         Self { task_id, digest }
     }
@@ -385,6 +401,7 @@ pub struct RuntimeEvidence {
     pub checked_at_ms: u64,
     pub detail: String,
 }
+/// 停止核实结果；confirmed=false 必须保留实例继续核对，不能上报完成或直接清理。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StopEvidence {
     pub confirmed: bool,
@@ -554,16 +571,20 @@ mod instance_control_tests {
     }
 }
 
+/// 后端只实现生命周期，不自行推导授权；Unknown 错误要求查询/停止原实例。
 #[async_trait]
 pub trait ExecutionBackend: Send + Sync {
     async fn probe(&self) -> Result<Capabilities, BackendError>;
+    /// 准备等待中的实例并先记录身份；可以产生控制面副作用，但不能运行用户入口。
     async fn prepare(&self, spec: ResolvedSpec) -> Result<PreparedInstance, BackendError>;
+    /// 消费绑定本实例的许可并尝试一次启动；响应丢失时不得再次调用以重跑任务。
     async fn start(
         &self,
         prepared: PreparedInstance,
         permit: LaunchPermit,
     ) -> Result<InstanceRef, BackendError>;
     async fn inspect(&self, instance: &InstanceRef) -> Result<RuntimeEvidence, BackendError>;
+    /// 先永久记录停止意图，再操作运行时；返回值必须区分发出请求和核实成功。
     async fn stop(
         &self,
         instance: &InstanceRef,
@@ -593,6 +614,7 @@ pub fn private_dir(path: &Path) -> Result<(), BackendError> {
     }
     Ok(())
 }
+/// 以 create_new 加文件/目录 fsync 写入不可覆盖标记；AlreadyExists 是防重放信号。
 pub fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<(), BackendError> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);

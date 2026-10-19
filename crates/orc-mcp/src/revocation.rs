@@ -1,5 +1,9 @@
-//! Delivery evidence is an owner-visible acknowledgement of durable revocation,
-//! never execution-stop evidence. The global revocation set remains authority.
+//! 撤销 outbox 及逐设备送达记录。
+//!
+//! service_revoked 是权威撤销集合，逐设备记录可从它补建；连接恢复时重新同步。
+//! RevokeAck 或已验证的 Ready 只能证明终端持久接收撤销，不能证明进程已经停止。
+//! 送达记录供所有者检查传播进度，不能替代 endpoint 的停止证据。
+
 use super::*;
 
 #[derive(Serialize, Deserialize)]
@@ -125,6 +129,7 @@ impl Mcp {
             .await?;
         Ok(())
     }
+    /// 只接受当前连接代数及对应撤销版本的 ACK；较旧 ACK 不能覆盖新撤销的待送达状态。
     pub(super) async fn acknowledge_revocation(
         &self,
         device: &str,

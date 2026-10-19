@@ -1,6 +1,11 @@
-//! Rootless gVisor execution. All Docker control arguments originate in owner
-//! configuration; task requests cannot change engine/runtime/image/mounts.
-//! A matching M0 validation record is mandatory in addition to live probing.
+//! 固定离线环境中的 rootless gVisor 后端。
+//!
+//! 所有者配置固定 engine、runsc、镜像和挂载；请求只选择已批准环境中的命令与输入。
+//! probe 同时检查配置、验证记录和实际环境；缺失条件直接拒绝，不能回退为宿主执行。
+//! prepare 固定快照副本并创建容器，start 消费许可，停止后才采集输出和文本产物。
+//! cleanup 使用分阶段凭据恢复清理；容器消失本身不构成停止成功的充分证据。
+//! 验证 JSON 是环境验收记录入口，不能把人工填写的布尔值当作已经通过真实验收。
+
 use async_trait::async_trait;
 use orc_execution::*;
 use serde::{Deserialize, Serialize};
@@ -16,6 +21,7 @@ pub struct ImageTool {
     pub path: PathBuf,
     pub sha256: String,
 }
+/// 仅由所有者提供的隔离环境配置；Agent 不能覆盖引擎 socket、运行时或宿主挂载。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GvisorConfig {
@@ -48,6 +54,7 @@ pub struct ValidationRecord {
     pub checks: BTreeMap<String, bool>,
     pub checked_at_ms: u64,
 }
+/// 可恢复清理阶段；仅 Complete 可作为容器已删除后的停止凭据。
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CleanupStage {
@@ -64,6 +71,7 @@ struct CleanupReceipt {
     stop_confirmed_at_ms: u64,
     recorded_at_ms: u64,
 }
+/// 验证清理凭据与持久原实例严格绑定；普通布尔标记不能证明停止或清理完成。
 fn read_cleanup_receipt(
     instance: &InstanceRef,
     name: &str,
@@ -82,6 +90,7 @@ fn read_cleanup_receipt(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        // SAFETY: getuid 不读写指针，只读取当前进程的真实 UID。
         if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::getuid() } {
             return Err(BackendError::Invalid(
                 "cleanup evidence must be private to the execution owner".into(),
@@ -189,6 +198,7 @@ impl GvisorBackend {
         }
         #[cfg(unix)]
         {
+            // SAFETY: getuid 无内存前置条件；这里只比较配置与服务的真实 UID。
             if unsafe { libc::getuid() } != c.execution_uid {
                 return Err(BackendError::Invalid(
                     "service UID differs from execution UID".into(),
@@ -251,9 +261,11 @@ impl GvisorBackend {
             let path = std::ffi::CString::new(self.config.scratch_root.as_os_str().as_bytes())
                 .map_err(|_| BackendError::Invalid("invalid scratch path".into()))?;
             let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            // SAFETY: path 是存活的 NUL 结尾字符串，stats 指向足够大小的可写存储。
             if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
+            // SAFETY: 上面的 statvfs 已成功返回，完整初始化了 stats。
             let stats = unsafe { stats.assume_init() };
             if stats.f_blocks.saturating_mul(stats.f_frsize) > 768 * 1024 * 1024 {
                 return Err(BackendError::CapabilityMissing(
@@ -412,6 +424,7 @@ impl GvisorBackend {
         }
         Ok(item.clone())
     }
+    /// 停止后解析有界输出帧并校对容器退出证据，最终 result.json 作为采集完成标记。
     pub async fn collect_output(
         &self,
         instance: &InstanceRef,
@@ -691,6 +704,7 @@ fn remove_collection_temporary(path: &Path) -> Result<(), BackendError> {
     }
     Ok(())
 }
+/// 验证流名、总预算及存在的终帧；缺终帧时标记监督丢失，仅保留完整片段。
 fn parse_output_frames(
     frames: &Path,
     directory: &Path,
@@ -778,6 +792,7 @@ fn parse_output_frames(
     Ok((result, complete))
 }
 
+/// 将不可信产物帧转为有界文本对象；验证路径、大小、摘要及完成帧后才返回清单。
 fn parse_artifact_frames(
     frames: &Path,
     output: &Path,
@@ -903,6 +918,7 @@ fn parse_artifact_frames(
 
 #[async_trait]
 impl ExecutionBackend for GvisorBackend {
+    /// 把验收记录与实际 engine/runtime/image/scratch 身份交叉核对，缺一项即拒绝隔离执行。
     async fn probe(&self) -> Result<Capabilities, BackendError> {
         self.validate_config()?;
         let validation = self.check_validation_record()?;
@@ -982,6 +998,7 @@ impl ExecutionBackend for GvisorBackend {
         Ok(Capabilities{available:true,platform:"linux-rootless-gvisor".into(),checked_at_ms:unix_ms(),limits:BTreeMap::from([
             ("filesystem_isolation".into(),Enforcement::Enforced),("network_isolation".into(),Enforcement::Enforced),("cpu".into(),Enforcement::Enforced),("memory".into(),Enforcement::Enforced),("guest_processes".into(),Enforcement::Enforced),("scratch".into(),Enforcement::Enforced)]),evidence:vec!["exact local M0 validation record matched live engine/runtime/image/scratch identity".into(),"Docker CLI adapter; Ubuntu integration remains a release gate".into()]})
     }
+    /// 持久记录实例意图，复制批准输入并 docker create；用户命令仍等待 start。
     async fn prepare(&self, resolved: ResolvedSpec) -> Result<PreparedInstance, BackendError> {
         self.probe().await?;
         resolved.validate_digest()?;
@@ -1144,6 +1161,7 @@ impl ExecutionBackend for GvisorBackend {
         refresh_lease(&instance)?;
         Ok(PreparedInstance { resolved, instance })
     }
+    /// 消费单次许可并启动不可变容器 ID；控制命令响应不明时保留 Unknown，不重复 start。
     async fn start(
         &self,
         prepared: PreparedInstance,
@@ -1252,6 +1270,7 @@ impl ExecutionBackend for GvisorBackend {
             .into(),
         })
     }
+    /// 按停止确认、scratch 删除、容器删除推进持久凭据；每次重试只继续清理原实例。
     async fn cleanup(&self, instance: &InstanceRef) -> Result<(), BackendError> {
         self.check_instance_metadata(instance)?;
         if read_cleanup_receipt(instance, "cleanup.json")?.is_some() {

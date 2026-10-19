@@ -1,3 +1,8 @@
+//! 本地所有者管理的设备登记和服务可见范围。
+//!
+//! invite_device 保存短期邀请，redeem_device 验证设备签名后原子消费邀请并登记。
+//! service_allow 另行指定主体可访问的设备；登记和允许转发均不创建终端执行 grant。
+
 use super::*;
 use orc_transport::{EnrollmentProof, EnrollmentRequest, Invitation};
 
@@ -64,6 +69,7 @@ impl Mcp {
         self.store.put_record("enrollment_invitation",&invitation.nonce,json!({"invitation_digest":invitation.digest()?,"expires_at":invitation.expires_at,"consumed":false,"name":params.name})).await?;
         Ok(serde_json::to_value(invitation)?)
     }
+    /// 验证双方签名后交 Store 原子消费邀请和登记设备；成功仍是 trusted_ungranted。
     pub(super) async fn redeem_device(&self, params: Value) -> Result<Value, AnyError> {
         let params: RedeemParams = serde_json::from_value(params)?;
         params.invitation.verify(

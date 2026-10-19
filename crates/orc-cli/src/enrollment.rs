@@ -1,5 +1,7 @@
-//! Public enrollment documents travel through protected files, never arguments
-//! containing private keys or long-lived credentials.
+//! 生成可交给所有者中转的公开登记请求和设备证明。
+//!
+//! 私钥从受保护文件读取，不放入命令行参数或输出；邀请验证与服务端兑换仍是独立步骤。
+
 use orc_transport::{AnyError, EnrollmentProof, EnrollmentRequest, IdentityFile, Invitation, now};
 use serde_json::{Value, json};
 use std::{io::Read, path::Path};

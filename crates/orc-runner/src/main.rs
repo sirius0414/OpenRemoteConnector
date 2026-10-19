@@ -1,4 +1,10 @@
-//! Two-stage task runner. `exec` remains single-threaded through fexecve.
+//! 两阶段 Linux runner，负责固定入口执行、输入输出预算和进程监督。
+//!
+//! supervise 等待单次 gate，再启动独立 exec 子进程；exec 路径在 fexecve 前保持单线程，
+//! 重新核对入口和 cwd 身份、封存脚本内容，并仅传入显式环境与允许的文件描述符。
+//! sandbox/prepare-scratch/collect/cleanup-scratch 是固定镜像中的受控辅助入口。
+//! runner 的退出码描述主命令；整组进程是否停止仍由 systemd/gVisor 后端核实。
+
 use orc_execution::*;
 use std::path::PathBuf;
 
@@ -108,6 +114,7 @@ mod linux {
         }
         Ok((time.tv_sec as u64).saturating_mul(1000) + (time.tv_nsec as u64) / 1_000_000)
     }
+    /// 单线程执行边界：复核 ELF/cwd、封存脚本、关闭继承 FD 后用 fexecve 替换进程。
     pub fn exec_stage(directory: &Path) -> Result<(), BackendError> {
         let resolved: ResolvedSpec = read_json(&directory.join("spec.json"), MAX_SPEC)?;
         resolved.validate_digest()?;
@@ -179,12 +186,14 @@ mod linux {
                         ));
                     }
                 }
+                // 把批准字节复制到 sealed memfd；解释器通过继承 FD 读取，避免再次按原路径打开脚本。
                 let name = cstring(b"orc-approved-script")?;
                 // SAFETY: name is NUL terminated; successful memfd is owned exactly once.
                 let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
                 if raw < 0 {
                     return Err(std::io::Error::last_os_error().into());
                 }
+                // SAFETY: raw 已检查成功，尚无其他拥有者；File 接管其关闭责任。
                 let mut file = unsafe { fs::File::from_raw_fd(raw) };
                 file.write_all(source.as_bytes())?;
                 // SAFETY: fcntl/lseek operate on our live memfd; sealing disallows mutation.
@@ -240,6 +249,7 @@ mod linux {
         unsafe { libc::fexecve(executable_fd, argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
         Err(std::io::Error::last_os_error().into())
     }
+    /// stdout/stderr 共用原子保留预算；超过预算仍持续排空管道，以免子进程被写满阻塞。
     async fn drain<R: tokio::io::AsyncRead + Unpin>(
         mut reader: R,
         path: PathBuf,
@@ -305,6 +315,7 @@ mod linux {
             .is_err()
         {
             if let Some(pid) = child.id() {
+                // SAFETY: child 尚未回收，负 PID 仍只指向其建立的进程组。
                 unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
             }
             let _ = child.kill().await;
@@ -481,6 +492,7 @@ mod linux {
         let mut spec = request.spec;
         // The host execution UID identifies the owner. Container UID is fixed by
         // the rootless profile and independently checked here.
+        // SAFETY: getuid 无指针或内存前置条件，读取当前容器进程的 UID。
         let uid = unsafe { libc::getuid() };
         if uid == 0 {
             return Err(BackendError::Invalid(
@@ -492,6 +504,7 @@ mod linux {
             rlim_cur: request.guest_process_limit,
             rlim_max: request.guest_process_limit,
         };
+        // SAFETY: limit 是完整初始化的 rlimit，调用期间引用保持有效。
         if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -532,6 +545,7 @@ mod linux {
     pub async fn supervise(directory: PathBuf) -> Result<RunnerResult, BackendError> {
         supervise_inner(directory, false).await
     }
+    /// 消费单次 gate，监督 exec 子进程和输出；墙钟与包含休眠时间的时钟共同约束期限。
     async fn supervise_inner(
         directory: PathBuf,
         framed: bool,
@@ -559,6 +573,7 @@ mod linux {
                 Err(e) => return Err(e),
             }
         }
+        // 先持久写 started 再移除 gate；崩溃可能留下未执行的尝试，但绝不能重复执行。
         write_new_json(&directory.join("started.json"), &resolved.digest).map_err(|e| match e {
             BackendError::Io(ref io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
                 BackendError::AlreadyAttempted
@@ -625,13 +640,35 @@ mod linux {
         let mut last_tick = boottime_ms()?;
         let (exit_code, reason) = loop {
             tokio::select! {
-                status=child.wait()=>{let status=status?;break(status.code(),if status.success(){"exit_zero"}else{"exit_nonzero"});},
-                _=interval.tick()=>{
-                    let now=boottime_ms()?;let bytes=total.load(Ordering::Relaxed);let elapsed=now.saturating_sub(last_tick);
-                    if elapsed>0 && bytes.saturating_sub(last_total).saturating_mul(1000)/elapsed>4*1024*1024 {if flood_start.is_none(){flood_start=Some(now);}} else {flood_start=None;}
-                    last_total=bytes;last_tick=now;
-                    if unix_ms()>=resolved.spec.deadline_unix_ms || now.saturating_sub(start)>=budget {terminate(&mut child).await;break(None,"deadline");}
-                    if flood_start.is_some_and(|t|now.saturating_sub(t)>=5000){terminate(&mut child).await;break(None,"output_flood");}
+                status = child.wait() => {
+                    let status = status?;
+                    break (status.code(), if status.success() { "exit_zero" } else { "exit_nonzero" });
+                },
+                _ = interval.tick() => {
+                    let now = boottime_ms()?;
+                    let bytes = total.load(Ordering::Relaxed);
+                    let elapsed = now.saturating_sub(last_tick);
+                    // 保留预算限制磁盘占用；持续洪泛另按实际读入速率计时，
+                    // 防止已截断输出仍无限消耗 CPU 和管道带宽。
+                    if elapsed > 0
+                        && bytes.saturating_sub(last_total).saturating_mul(1000) / elapsed > 4 * 1024 * 1024
+                    {
+                        if flood_start.is_none() {
+                            flood_start = Some(now);
+                        }
+                    } else {
+                        flood_start = None;
+                    }
+                    last_total = bytes;
+                    last_tick = now;
+                    if unix_ms() >= resolved.spec.deadline_unix_ms || now.saturating_sub(start) >= budget {
+                        terminate(&mut child).await;
+                        break (None, "deadline");
+                    }
+                    if flood_start.is_some_and(|t| now.saturating_sub(t) >= 5000) {
+                        terminate(&mut child).await;
+                        break (None, "output_flood");
+                    }
                 }
             }
         };

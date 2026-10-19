@@ -1,4 +1,9 @@
-//! Local owner management. This protocol is never exposed as an Agent tool.
+//! 仅供本机所有者使用的管理 RPC，不作为 Agent 工具暴露。
+//!
+//! Unix socket 权限和双方 peer UID 校验共同建立同账户边界；每条连接处理一个有界 JSON 行。
+//! 服务端限制并发及读写时间，客户端核对 socket 与对端归属后才发送审批/撤销等命令。
+//! 此边界不能隔离所有者同 UID 下的任意代码，具体管理动作由 Handler 实现。
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -46,6 +51,7 @@ impl Response {
         }
     }
 }
+/// 仅处理已通过本地 UID 检查的管理请求；实现方仍负责具体动作的状态与授权约束。
 #[async_trait::async_trait]
 pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, request: Request) -> Response;
@@ -89,6 +95,7 @@ async fn read_message(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>, Err
         }
     }
 }
+/// 验证本地对端 UID，限制并发和单行消息大小；同 UID 任意代码仍处于此信任边界内。
 pub async fn serve(socket: &Path, owner_uid: u32, handler: Arc<dyn Handler>) -> Result<(), Error> {
     secure_dir(socket.parent().ok_or(Error::Permission)?)?;
     if socket.exists() {
@@ -112,21 +119,29 @@ pub async fn serve(socket: &Path, owner_uid: u32, handler: Arc<dyn Handler>) -> 
         tokio::select! {
             incoming = listener.accept() => {
                 let (stream, _) = incoming?;
-                if stream.peer_cred()?.uid() != owner_uid { continue; }
+                if stream.peer_cred()?.uid() != owner_uid {
+                    continue;
+                }
                 let Ok(permit) = capacity.clone().try_acquire_owned() else { continue };
                 let handler = handler.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
                     let mut reader = BufReader::new(stream);
-                    let Ok(Ok(bytes)) = tokio::time::timeout(std::time::Duration::from_secs(10), read_message(&mut reader)).await else { return };
+                    let Ok(Ok(bytes)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(10), read_message(&mut reader)
+                    ).await else { return };
                     let response = match serde_json::from_slice::<Request>(&bytes) {
                         Ok(request) => handler.handle(request).await,
                         Err(_) => Response::error("INVALID_REQUEST"),
                     };
                     if let Ok(mut bytes) = serde_json::to_vec(&response) {
-                        if bytes.len() >= MAX_MESSAGE { bytes = b"{\"result\":null,\"error\":\"RESPONSE_TOO_LARGE\"}".to_vec(); }
+                        if bytes.len() >= MAX_MESSAGE {
+                            bytes = b"{\"result\":null,\"error\":\"RESPONSE_TOO_LARGE\"}".to_vec();
+                        }
                         bytes.push(b'\n');
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), reader.get_mut().write_all(&bytes)).await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(10), reader.get_mut().write_all(&bytes)
+                        ).await;
                     }
                 });
             }
@@ -134,6 +149,7 @@ pub async fn serve(socket: &Path, owner_uid: u32, handler: Arc<dyn Handler>) -> 
         }
     }
 }
+/// 发送前同时核对 socket 文件和实际连接对端，避免只凭路径名称信任管理服务。
 pub async fn call(socket: &Path, request: Request) -> Result<Response, Error> {
     let meta = std::fs::symlink_metadata(socket)?;
     if meta.file_type().is_symlink() || meta.uid() != current_uid() || meta.mode() & 0o077 != 0 {

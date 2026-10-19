@@ -1,5 +1,9 @@
-//! Strict wire parsing, deterministic integer-only canonical JSON, and signed
-//! delegation envelopes. Schema validation is independent of MCP presentation.
+//! 不可信消息进入系统的解析、摘要和签名边界。
+//!
+//! 先 `strict_decode` 拒绝重复键/非整数，再用 `canonical_bytes` 生成确定性字节；
+//! `SignedEnvelope::verify` 将请求绑定到已信任主体、设备、连接代数和服务策略版本。
+//! 信封上下文必须来自本地已验证连接，不能从待验证信封反向构造。
+//! 这里校验传输契约；最终执行授权仍由 endpoint 的本地 grant 决定。
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use orc_domain::{DeviceId, Error, ErrorCode, McpId, Principal, Result, SubmissionId};
@@ -214,6 +218,8 @@ pub fn check_capabilities(required: &BTreeSet<String>, available: &BTreeSet<Stri
     Ok(())
 }
 
+/// MCP 对一次投递的身份委托；包含请求摘要、目标与短期连接上下文。
+/// 投递期限约束信封接收，不能替代任务自身的接受窗口或运行期限。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
@@ -272,6 +278,8 @@ impl SignedEnvelope {
         Ok(Self { payload, signature })
     }
 
+    /// 同时验证签名、摘要、目标、时窗和当前连接事实。
+    /// 能力检查合并信封声明与本地 schema 的强制能力，防止请求通过省略字段自行降级。
     pub fn verify(&self, key: &VerifyingKey, context: &EnvelopeContext<'_>) -> Result<()> {
         let raw = hex_decode(&self.signature)?;
         let signature = Signature::from_slice(&raw)
@@ -371,6 +379,7 @@ pub fn operation_capabilities(operation: &str) -> Result<BTreeSet<String>> {
     Ok(names.iter().map(|name| (*name).to_owned()).collect())
 }
 
+/// 带序号和摘要的有界数据块；调用方保存下一期望序号，不信任发送方顺序。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Chunk {

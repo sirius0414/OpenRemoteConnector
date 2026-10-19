@@ -1,4 +1,11 @@
-//! Independent MCP forwarding service. This crate has no execution backend.
+//! 独立 MCP 服务：认证 Agent、维护设备连接并转发已签名请求。
+//!
+//! HTTP 请求先 authenticate，再经 invoke/forward 注入服务端 Principal；
+//! 设备主动建立 mTLS/WebSocket，完成 Hello → Sync → Ready 后才进入可转发目录。
+//! service_allow 仅允许转发到设备，endpoint 仍需用本地 grant 批准具体动作。
+//! permissions 锁协调撤销、签名入队和连接发布；等待设备响应时释放它，避免阻塞撤销。
+//! 本 crate 不含执行后端；投递超时返回未知状态，不能由 MCP 自动重跑任务。
+
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
@@ -56,6 +63,7 @@ struct Dispatch {
 struct MaintenanceProbe {
     reply: oneshot::Sender<std::result::Result<Value, String>>,
 }
+/// 仅在握手与撤销同步完成后发布的连接；epoch 区分同一设备的不同时期会话。
 #[derive(Clone)]
 struct Connection {
     epoch: u64,
@@ -262,6 +270,7 @@ impl Mcp {
             .put_record("service_metadata", "revision", json!({"value":revision}))
             .await?;
         self.repair_delivery_records().await?;
+        // 控制队列满时关闭通道，强制重连同步；不能继续发健康心跳掩盖未传播的撤销。
         let mut connections = self.connections.lock().await;
         let mut disconnected = 0;
         for connection in connections.values_mut() {
@@ -315,6 +324,7 @@ impl Mcp {
         }
         Ok(())
     }
+    /// 校验工具结构并路由；Principal 必须来自 HTTP 认证中间件，不可由 args 覆盖。
     pub async fn invoke(
         &self,
         principal: Principal,
@@ -377,6 +387,8 @@ impl Mcp {
         }
         self.forward(&principal, tool, args).await
     }
+    /// 在权限锁内复核可见范围、记录投递摘要、签名并入队，随后释放锁等待响应。
+    /// 提交超时仅表示 delivery_unknown；客户端需查询原 submission_id 而非换 ID 重发。
     async fn forward(
         &self,
         principal: &Principal,
@@ -490,20 +502,39 @@ impl Mcp {
         let mut sessions = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                accepted=listener.accept()=>{
-                    let(stream,_)=accepted?;let Ok(permit)=slots.clone().try_acquire_owned() else{continue};let acceptor=acceptor.clone();let state=self.clone();
-                    sessions.spawn(async move{let _permit=permit;let result=async{
-                        let tls=tokio::time::timeout(Duration::from_secs(10),acceptor.accept(stream)).await??;
-                        let cert=tls.get_ref().1.peer_certificates().and_then(|c|c.first()).ok_or("device certificate absent")?;
-                        let fingerprint=orc_transport::certificate_digest(cert.as_ref());
-                        let ws=tokio::time::timeout(Duration::from_secs(10),tokio_tungstenite::accept_hdr_async_with_config(tls,websocket_path,Some(orc_transport::websocket_config()))).await??;
-                        state.device_session(ws,fingerprint).await
-                    }.await;if result.is_err(){tracing::warn!(event="device_channel_closed");}});
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    // 握手也占用并发额度，防止未认证连接耗尽会话任务。
+                    let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+                    let acceptor = acceptor.clone();
+                    let state = self.clone();
+                    sessions.spawn(async move {
+                        let _permit = permit;
+                        let result = async {
+                            let tls = tokio::time::timeout(
+                                Duration::from_secs(10), acceptor.accept(stream)
+                            ).await??;
+                            let cert = tls.get_ref().1.peer_certificates()
+                                .and_then(|c| c.first()).ok_or("device certificate absent")?;
+                            let fingerprint = orc_transport::certificate_digest(cert.as_ref());
+                            let ws = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                tokio_tungstenite::accept_hdr_async_with_config(
+                                    tls, websocket_path, Some(orc_transport::websocket_config())
+                                )
+                            ).await??;
+                            state.device_session(ws, fingerprint).await
+                        }.await;
+                        if result.is_err() {
+                            tracing::warn!(event = "device_channel_closed");
+                        }
+                    });
                 }
-                Some(_)=sessions.join_next(),if !sessions.is_empty()=>{}
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
             }
         }
     }
+    /// 核对登记证书和身份，持久分配 epoch，完成撤销同步后发布有界设备通道。
     async fn device_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         &self,
         mut ws: tokio_tungstenite::WebSocketStream<S>,
@@ -575,6 +606,7 @@ impl Mcp {
         let closed = tokio_util::sync::CancellationToken::new();
         {
             let _guard = self.permissions.lock().await;
+            // Sync 发出后撤销版本可能已变；发布连接前再核对，拒绝带旧权限快照的 Ready。
             if self.service_revision().await? != service_revision {
                 return Err("SYNC_CHANGED".into());
             }
@@ -601,19 +633,60 @@ impl Mcp {
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
         let mut last_seen = tokio::time::Instant::now();
         let mut sequence = 0;
-        let result:Result<(),AnyError>=async{loop{tokio::select!{biased;
-            _=closed.cancelled()=>return Err("RESYNC_REQUIRED".into()),
-            frame=controls.recv()=>{let Some(frame)=frame else{return Err("CONTROL_CLOSED".into())};orc_transport::send(&mut ws,&frame).await?;}
-            probe=probes.recv(),if pending.is_empty()&&rx.is_empty()=>{let Some(probe)=probe else{return Err("CONTROL_CLOSED".into())};let id=uuid::Uuid::new_v4().to_string();orc_transport::send(&mut ws,&Frame::MaintenanceProbe{id:id.clone()}).await?;pending.insert(id,probe.reply);}
-            _=heartbeat.tick()=>{if last_seen.elapsed()>Duration::from_secs(15){return Err("CONTROL_LOST".into())}sequence+=1;orc_transport::send(&mut ws,&Frame::Ping{sequence}).await?;pending.retain(|_,reply|!reply.is_closed());}
-            frame=orc_transport::receive(&mut ws)=>{match frame?{
-                Frame::Pong{sequence:n} if n==sequence=>last_seen=tokio::time::Instant::now(),
-                Frame::RevokeAck{principal_id,revision}=>self.acknowledge_revocation(device_id,epoch,&principal_id,revision).await?,
-                Frame::Response{id,result,error}=>{if let Some(reply)=pending.remove(&id){let _=reply.send(match error{Some(e)=>Err(e),None=>result.ok_or("EMPTY_RESPONSE".into())});}},
-                _=>return Err("INVALID_FRAME".into()),
-            }}
-            dispatch=rx.recv(),if pending.len()<8=>{let Some(dispatch)=dispatch else{return Err("CONTROL_CLOSED".into())};let id=uuid::Uuid::new_v4().to_string();orc_transport::send(&mut ws,&Frame::Request{id:id.clone(),envelope:dispatch.envelope}).await?;pending.insert(id,dispatch.reply);}
-        }}}.await;
+        let result: Result<(), AnyError> = async {
+            loop {
+                // 撤销/强制重同步优先于普通投递；pending 只保存响应等待者，
+                // 等待者断开并不撤销已经送达 endpoint 的任务。
+                tokio::select! { biased;
+                    _ = closed.cancelled() => return Err("RESYNC_REQUIRED".into()),
+                    frame = controls.recv() => {
+                        let Some(frame) = frame else { return Err("CONTROL_CLOSED".into()) };
+                        orc_transport::send(&mut ws, &frame).await?;
+                    }
+                    probe = probes.recv(), if pending.is_empty() && rx.is_empty() => {
+                        let Some(probe) = probe else { return Err("CONTROL_CLOSED".into()) };
+                        let id = uuid::Uuid::new_v4().to_string();
+                        orc_transport::send(
+                            &mut ws, &Frame::MaintenanceProbe { id: id.clone() }
+                        ).await?;
+                        pending.insert(id, probe.reply);
+                    }
+                    _ = heartbeat.tick() => {
+                        if last_seen.elapsed() > Duration::from_secs(15) {
+                            return Err("CONTROL_LOST".into())
+                        }
+                        sequence += 1;
+                        orc_transport::send(&mut ws, &Frame::Ping { sequence }).await?;
+                        pending.retain(|_, reply| !reply.is_closed());
+                    }
+                    frame = orc_transport::receive(&mut ws) => {
+                        match frame? {
+                            Frame::Pong { sequence: n } if n == sequence =>
+                                last_seen = tokio::time::Instant::now(),
+                            Frame::RevokeAck { principal_id, revision } =>
+                                self.acknowledge_revocation(device_id, epoch, &principal_id, revision).await?,
+                            Frame::Response { id, result, error } => {
+                                if let Some(reply) = pending.remove(&id) {
+                                    let _ = reply.send(match error {
+                                        Some(e) => Err(e),
+                                        None => result.ok_or("EMPTY_RESPONSE".into())
+                                    });
+                                }
+                            },
+                            _ => return Err("INVALID_FRAME".into()),
+                        }
+                    }
+                    dispatch = rx.recv(), if pending.len() < 8 => {
+                        let Some(dispatch) = dispatch else { return Err("CONTROL_CLOSED".into()) };
+                        let id = uuid::Uuid::new_v4().to_string();
+                        orc_transport::send(
+                            &mut ws, &Frame::Request { id: id.clone(), envelope: dispatch.envelope }
+                        ).await?;
+                        pending.insert(id, dispatch.reply);
+                    }
+                }
+            }
+        }.await;
         let mut connections = self.connections.lock().await;
         if connections.get(device_id).is_some_and(|c| c.epoch == epoch) {
             connections.remove(device_id);
@@ -714,6 +787,7 @@ fn tool_failure(error: &AnyError, args: &Value) -> Value {
     json!({"code":code,"message":message,"retry_mode":retry_mode,"next_action":next_action,"device_id":args.get("device_id"),"task_id":args.get("task_id"),"submission_id":args.get("submission_id")})
 }
 
+/// 认证 Bearer 并在 rmcp 解析前拒绝歧义 JSON，再把可信主体放入 request extensions。
 async fn authenticate(
     State(state): State<Arc<Mcp>>,
     request: Request<Body>,

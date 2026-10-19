@@ -1,5 +1,9 @@
-//! Owner-only trust replacement. Revoking identity and stopping its work are
-//! separate facts; replacement never makes old grants valid again.
+//! 所有者发起的 MCP 信任更换，必须先撤销旧信任并确认旧任务停止。
+//!
+//! trust_revoke 先关闭当前进程入口，再持久化撤销并使旧 grant 失效；
+//! trust_set 校验新邀请和证书后更新持久信任，但仍要求使用新配置重启。
+//! 持久配置更新不能令仍连接旧 MCP 的进程自动恢复执行权限。
+
 use super::*;
 use std::sync::atomic::Ordering;
 

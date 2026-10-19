@@ -1,4 +1,9 @@
-//! Independent stop-only supervisor. Never launches or replays a task.
+//! 独立的只停止监督进程；不接受任务、不恢复审批、不启动用户命令。
+//!
+//! 扫描持久 InstanceRef，检查任务绝对期限与 endpoint 更新的 SupervisorLease。
+//! 租约缺失、过旧或身份不匹配时请求停止；只有绑定原实例的确认凭据可跳过后续检查。
+//! 它在 endpoint 卡死/退出时继续工作；自身 heartbeat 则供 endpoint 判断能否接受或继续任务。
+
 use orc_backend_gvisor::{GvisorBackend, GvisorConfig};
 use orc_backend_host_linux::{HostBackend, HostConfig};
 use orc_execution::*;
@@ -79,6 +84,7 @@ async fn run() -> Result<(), BackendError> {
             let lease =
                 read_json::<SupervisorLease>(&entry.path().join("lease.json"), MAX_SPEC).ok();
             let expired = now >= instance.deadline_unix_ms;
+            // 租约与完整实例绑定；未来时间或身份变化也视为失联，不能借旧租约延长新实例。
             let lost = lease.as_ref().is_none_or(|l| {
                 l.instance != instance
                     || l.updated_at_ms > now + 1000
@@ -109,6 +115,7 @@ async fn run() -> Result<(), BackendError> {
                     detail: "watchdog could not verify termination; owner reconciliation required"
                         .into(),
                 });
+            // 只有已核实停止才写可跳过的永久记录；未知结果单独记录，下轮继续尝试停止。
             if evidence.confirmed {
                 write_json_atomic(
                     &entry.path().join("watchdog-stop.json"),
